@@ -1,0 +1,27 @@
+{
+  "name": "moonwell-withdraw-bot",
+  "version": "1.0.0",
+  "description": "Bot Node.js pour retirer des USDC de Moonwell (Base) en plusieurs chunks selon la liquidité disponible",
+  "main": "moonwell-withdraw-bot-chunked.js",
+  "packageManager": "yarn@1.22.22",
+  "scripts": {
+    "start": "node moonwell-withdraw-bot-chunked.js"
+  },
+  "keywords": [
+    "moonwell",
+    "base",
+    "usdc",
+    "withdraw",
+    "defi",
+    "ethereum",
+    "compound"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.0.0"
+  }
+}
