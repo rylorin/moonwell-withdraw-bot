@@ -1,6 +1,6 @@
 # PLAN — Correctifs & améliorations du bot Moonwell
 
-Statut : **P1 & P2 traités le 09/09/2026** (correctifs appliqués + tests unitaires `tests/bot.test.js`, 31 tests). P3–P6 toujours ouverts.
+Statut : **P1, P2 & P3 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 63 tests). P4–P6 toujours ouverts.
 Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ## Barème de priorité
@@ -51,9 +51,9 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ---
 
-## 🟠 P3 — Aucune reconnexion / surveillance du WSS Alchemy
+## ✅ 🟡 P3 — Aucune reconnexion / surveillance du WSS Alchemy (TRAITÉ)
 
-**Localisation** : [provider création ligne 90](../moonwell-withdraw-bot-chunked.js#L90), [souscription ligne 237](../moonwell-withdraw-bot-chunked.js#L237)
+**Localisation** : [createWssWatchdog (watchdog) ligne 638](../moonwell-withdraw-bot-chunked.js#L638), [watchdog instancié dans main() ligne 807](../moonwell-withdraw-bot-chunked.js#L807)
 
 **Problème** : aucun handler `error` / `close` sur `WebSocketProvider`. Si Alchemy ferme la connexion (idle, rate-limit, rebalance), les events `block` s'arrêtent **silencieusement** : le bot continue d'afficher des logs mais ne réagit plus.
 
@@ -63,7 +63,9 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 2. Tenter de recréer le provider + relancer la souscription (ou au minimum sortir avec un message d'erreur explicite plutôt que de se taire)
 3. **Optionnel** : garde-fou anti-stall — si aucune tx ni aucun bloc traité depuis X minutes, alerte
 
-**Critère de validation** : couper la connexion réseau en cours d'exécution → log explicite et soit reconnexion, soit arrêt propre.
+**Correctif appliqué (11/09/2026)** : nouveau factory `createWssWatchdog` exporté — heartbeat (`WS_CHECK_MS`) + seuil de silence (`WS_STALL_MS`) ; sa propre souscription `block` alimente l'horloge, et les events `error` / `close` du provider/websocket sont loggés (URL masquée, jamais de clé). En cas de stall : si une tx est en vol, la reconnexion est différée (budget non consommé) ; sinon l'ancien provider est détruit, un nouveau est créé (`buildWss`), la souscription `block` est relancée et `runner.setConnection` rebranche la soumission sur le nouveau provider. Comportement piloté par `WS_ON_STALL` : `reconnect` (défaut, jusqu'à `WS_MAX_RECONNECTS` tentatives avant arrêt) ou `exit` (alerte + arrêt immédiat, également sur `close` du socket).
+
+**Critère de validation** : couper la connexion réseau en cours d'exécution → log explicite et soit reconnexion, soit arrêt propre. ✅ couvert par les tests `watchdog:*` (stall → reconnexion budgetée, `WS_ON_STALL=exit`, fermeture du socket, reconnexion différée, rebind `setProvider`, budget épuisé → `process.exit(1)`) et `runner: setConnection …`.
 
 ---
 
@@ -123,7 +125,7 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 2. **P1** (timeout + reprise de boucle) — la correction la plus importante pour la fiabilité
 3. **P4** (arrêt propre) + **P6** (nettoyage) — rapides, confort d'utilisation
 4. **P5** (parsing montants) — à faire avec un mini test manuel
-5. **P3** (reconnexion WSS) — plus lourd, à planifier séparément
+5. **P3** (reconnexion WSS) — ✅ traité le 11/09/2026
 6. Les améliorations optionnelles si le bot doit tourner en production durable
 
 ## Checklist de validation après traitement
@@ -132,6 +134,6 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 - [ ] Lancement à blanc sans vraie clé → erreurs placeholder toujours actives (pas de fuite de secrets)
 - [ ] Simuler une tx non minée → reprise de boucle sous 60 s (P1)
 - [ ] Simuler 2 events simultanés → une seule soumission (P2)
-- [ ] Couper le réseau → log explicite / reconnexion (P3)
+- [x] Couper le réseau → log explicite / reconnexion (P3) — couvert par les tests watchdog 53–63
 - [ ] Reliquat < MIN → arrêt propre (P4)
 - [ ] `WITHDRAW_AMOUNT` avec >6 décimales → erreur explicite (P5)

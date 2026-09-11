@@ -36,6 +36,7 @@ const {
   createChunkRunner,
   createBalanceWiring,
   createBalanceMonitor,
+  createWssWatchdog,
   DEFAULT_GAS_TIERS,
 } = bot;
 
@@ -875,4 +876,292 @@ test("balance monitor: a failing LP read degrades to n/a without killing the rea
   await monitor.read();
   assert.ok(logs[0].includes("| LP tokens: n/a"));
   assert.ok(logs[0].includes("USDC"), "underlying balance line still logged");
+});
+
+// ---------------------------------------------------------------------------
+// createWssWatchdog — surveillance + reconnexion de la connexion WSS (P3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a watchdog with captured logs, an injectable clock, a mock provider
+ * (with `.on/.off` and `.websocket`) and a mock process.exit. `step(ms)`
+ * advances the fake clock, `fire()` triggers one heartbeat tick and lets the
+ * onReconnect microtasks settle, `block()` signals a received block.
+ */
+function makeWatchdog(overrides = {}) {
+  const logs = [];
+  const warns = [];
+  const errors = [];
+  const log = {
+    log: (m) => logs.push(String(m)),
+    warn: (m) => warns.push(String(m)),
+    error: (m) => errors.push(String(m)),
+  };
+  let fakeNow = overrides.now ?? 1_000_000;
+  let hb = null;
+  let checkDelay = -1;
+  let cleared = 0;
+  const setTimer = (cb, delay) => {
+    hb = cb;
+    checkDelay = delay;
+    return "TMR";
+  };
+  const clearTimer = () => {
+    cleared++;
+  };
+  const listeners = { block: [], error: [], close: [] };
+  const provider = {
+    on: (ev, cb) => (listeners[ev] = listeners[ev] || []).push(cb),
+    off: (ev, cb) => {
+      if (!listeners[ev]) return;
+      listeners[ev] = listeners[ev].filter((f) => f !== cb);
+    },
+    websocket: {
+      on: (ev, cb) => (listeners[ev] = listeners[ev] || []).push(cb),
+      off: (ev, cb) => {
+        if (!listeners[ev]) return;
+        listeners[ev] = listeners[ev].filter((f) => f !== cb);
+      },
+    },
+  };
+  const exitCalls = [];
+  const processExit = (code) => exitCalls.push(code);
+  let reconnectCalls = 0;
+  const wd = createWssWatchdog({
+    provider,
+    url: overrides.url ?? "wss://alchemy.example/v2/SuperSecretKey123",
+    log,
+    now: () => fakeNow,
+    setTimer,
+    clearTimer,
+    maskUrlFn: maskUrl,
+    silenceTimeoutMs: overrides.silenceTimeoutMs ?? 15_000,
+    checkIntervalMs: overrides.checkIntervalMs ?? 5_000,
+    maxReconnects: overrides.maxReconnects ?? 5,
+    reconnect: overrides.reconnect ?? true,
+    onReconnect:
+      overrides.onReconnect ??
+      (async () => {
+        reconnectCalls++;
+      }),
+    shouldReconnect: overrides.shouldReconnect ?? (() => true),
+    processExit,
+  });
+  return {
+    wd,
+    provider,
+    listeners,
+    logs,
+    warns,
+    errors,
+    exitCalls,
+    reconnectCalls: () => reconnectCalls,
+    checkDelay,
+    cleared: () => cleared,
+    step: (ms) => {
+      fakeNow += ms;
+    },
+    fire: async () => {
+      hb();
+      // Drainage complet des microtâches: reset() (chaînée après onReconnect)
+      // doit être terminé avant le prochain heartbeat, comme en prod où les ticks
+      // sont espacés de checkIntervalMs.
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    block: () => wd.tick(),
+  };
+}
+
+test("watchdog: provider error → warn immédiat sans fuite de clé", () => {
+  const t = makeWatchdog({});
+  t.listeners.error[0](new Error("ECONNRESET"));
+  assert.equal(t.warns.length, 1);
+  assert.ok(t.warns[0].includes("erreur détectée"));
+  assert.ok(
+    !t.warns[0].includes("SuperSecretKey123"),
+    "la clé API ne doit jamais apparaître",
+  );
+  assert.equal(t.wd.state.socketDown, false, "le heartbeat reste l'autorité");
+});
+
+test("watchdog: websocket close → warn masqué + socketDown", () => {
+  const t = makeWatchdog({});
+  t.listeners.close[0]();
+  assert.equal(t.warns.length, 1);
+  assert.ok(t.warns[0].includes("v2/***"), "URL masquée");
+  assert.ok(!t.warns[0].includes("SuperSecretKey123"));
+  assert.equal(t.wd.state.socketDown, true);
+});
+
+test("watchdog: heartbeat détecte le stall et déclenche onReconnect une fois par cycle", async () => {
+  const t = makeWatchdog({});
+  assert.equal(t.checkDelay, 5_000, "heartbeat à checkIntervalMs");
+
+  t.step(20_000); // silence au-delà de 15 s
+  await t.fire();
+  assert.equal(t.reconnectCalls(), 1, "onReconnect appelé une fois");
+  assert.equal(t.wd.state.reconnectCount, 1);
+  assert.ok(
+    t.warns.some((w) => /tentative de reconnexion/.test(w)),
+    "warn avant la tentative",
+  );
+
+  // reset() a ré-armé l'horloge : sans nouveau temps, pas de 2e appel
+  await t.fire();
+  assert.equal(t.reconnectCalls(), 1);
+
+  // nouveau cycle de silence → 2e tentative
+  t.step(20_000);
+  await t.fire();
+  assert.equal(t.reconnectCalls(), 2);
+  assert.equal(t.wd.state.reconnectCount, 2);
+});
+
+test("watchdog: reset vide l'état de stall mais conserve le budget", async () => {
+  const t = makeWatchdog({});
+  t.step(20_000);
+  await t.fire();
+  assert.equal(t.wd.state.reconnectCount, 1);
+
+  t.wd.reset();
+  assert.equal(t.wd.state.stallActive, false);
+  assert.equal(t.wd.state.stallCount, 0);
+  assert.equal(t.wd.state.socketDown, false);
+  assert.equal(t.wd.state.reconnectCount, 1, "budget conservé");
+});
+
+test("watchdog: budget maxReconnects épuisé → process.exit(1) une seule fois", async () => {
+  const t = makeWatchdog({ maxReconnects: 3 });
+  for (let i = 0; i < 4; i++) {
+    t.step(20_000);
+    await t.fire();
+  }
+  assert.equal(t.reconnectCalls(), 3, "3 tentatives avant l'abandon");
+  assert.deepEqual(t.exitCalls, [1]);
+  assert.equal(t.wd.state.reconnectCount, 3);
+
+  // encore du silence → rien de plus (exited déjà posé)
+  t.step(20_000);
+  await t.fire();
+  assert.equal(t.reconnectCalls(), 3);
+  assert.equal(t.exitCalls.length, 1, "process.exit appelé une seule fois");
+});
+
+test("watchdog: WS_ON_STALL=exit → pas de reconnexion, process.exit(1) sur stall", async () => {
+  const t = makeWatchdog({ reconnect: false });
+  t.step(20_000);
+  await t.fire();
+  assert.deepEqual(t.exitCalls, [1]);
+  assert.equal(t.reconnectCalls(), 0, "aucune tentative");
+  assert.ok(t.errors[0].includes("WS_ON_STALL=exit"), "message explicite");
+});
+
+test("watchdog: mode exit → arrêt immédiat lors de la fermeture du socket", () => {
+  const t = makeWatchdog({ reconnect: false });
+  t.listeners.close[0]();
+  assert.deepEqual(t.exitCalls, [1]);
+  assert.equal(t.reconnectCalls(), 0);
+});
+
+test("watchdog: reconnexion différée (tx en vol) sans consommer le budget", async () => {
+  let allow = false;
+  const t = makeWatchdog({ shouldReconnect: () => allow });
+  t.step(20_000);
+  await t.fire();
+  assert.equal(t.reconnectCalls(), 0, "différée tant que tx en vol");
+  assert.equal(t.wd.state.reconnectCount, 0, "budget non consommé");
+  assert.ok(t.warns.some((w) => /différée/.test(w)));
+  assert.equal(t.exitCalls.length, 0);
+
+  // la tx se pose, puis un nouveau cycle de silence relaie la reconnexion
+  allow = true;
+  t.step(20_000);
+  await t.fire();
+  assert.equal(t.reconnectCalls(), 1);
+  assert.equal(t.wd.state.reconnectCount, 1);
+});
+
+test("watchdog: setProvider rebranche sur un nouveau provider sans crash", () => {
+  const t = makeWatchdog({});
+  const fresh = {
+    on: (ev, cb) => (t.listeners[ev] = t.listeners[ev] || []).push(cb),
+    off: (ev, cb) => {
+      if (!t.listeners[ev]) return;
+      t.listeners[ev] = t.listeners[ev].filter((f) => f !== cb);
+    },
+    websocket: {
+      on: (ev, cb) => (t.listeners[ev] = t.listeners[ev] || []).push(cb),
+      off: (ev, cb) => {
+        if (!t.listeners[ev]) return;
+        t.listeners[ev] = t.listeners[ev].filter((f) => f !== cb);
+      },
+    },
+  };
+  t.wd.setProvider(fresh);
+  t.block(); // un block sur le provider frais relance le heartbeat
+  assert.equal(t.wd.state.socketDown, false);
+});
+
+test("runner: setConnection swap la cible de soumission et le destroy", async () => {
+  const d = makeDeps({ targetUsd: 100, cash: 100 });
+  const mcalls = { redeem: 0, removeAll: 0, destroy: 0 };
+  const receipt1 = { status: 1, blockNumber: 950, logs: [] };
+  const m1 = {
+    interface: { parseLog: () => null },
+    getCash: async () => parse("100"),
+    redeemUnderlying: async () => {
+      mcalls.redeem++;
+      return { hash: "0xNEW", wait: async () => receipt1 };
+    },
+  };
+  const p1 = {
+    getTransaction: async () => ({ blockNumber: 900 }),
+    getTransactionReceipt: async () => receipt1,
+    removeAllListeners: () => {
+      mcalls.removeAll++;
+    },
+    destroy: async () => {
+      mcalls.destroy++;
+    },
+  };
+
+  d.runner.setConnection({ mUsdc: m1, provider: p1 });
+  d.runner.setConnection({ mUsdc: m1, provider: p1 }); // idempotent
+  await d.runner.attemptChunk();
+
+  assert.equal(mcalls.redeem, 1, "soumission via le nouveau mUsdc");
+  assert.equal(d.calls.redeem, 0, "l'ancien mUsdc n'est plus touché");
+  assert.equal(d.calls.getCashPublic, 1, "mUsdcRead (lecture seule) inchangé");
+  assert.equal(d.runner.state.remainingRaw, 0n);
+  assert.equal(d.runner.state.stopped, true);
+  assert.equal(d.calls.exit, 1);
+  assert.equal(mcalls.destroy, 1, "done() détruit le nouveau provider");
+  assert.equal(d.calls.destroyed, 0, "l'ancien provider n'est jamais détruit");
+  assert.equal(mcalls.removeAll, 1);
+});
+
+test("loadConfig exposes the WSS watchdog knobs (defaults + env)", () => {
+  const d = loadConfig({});
+  assert.equal(d.wssStallMs, 15000);
+  assert.equal(d.wssCheckMs, 5000);
+  assert.equal(d.wssMaxReconnects, 5);
+  assert.equal(d.wssOnStall, "reconnect");
+
+  const e = loadConfig({
+    WS_STALL_MS: "120000",
+    WS_CHECK_MS: "30000",
+    WS_MAX_RECONNECTS: "2",
+    WS_ON_STALL: "exit",
+  });
+  assert.equal(e.wssStallMs, 120000);
+  assert.equal(e.wssCheckMs, 30000);
+  assert.equal(e.wssMaxReconnects, 2);
+  assert.equal(e.wssOnStall, "exit");
+
+  assert.equal(loadConfig({ WS_STALL_MS: "50" }).wssStallMs, 1000, "clamp min");
+  assert.equal(
+    loadConfig({ WS_MAX_RECONNECTS: "junk" }).wssMaxReconnects,
+    1,
+    "valeur invalide ≈ défaut sûr (NaN-safe)",
+  );
 });

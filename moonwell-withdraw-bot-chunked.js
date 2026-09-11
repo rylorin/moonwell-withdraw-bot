@@ -71,6 +71,20 @@ function loadConfig(env = process.env) {
     //    monitor interval old, then corrected by each confirmed chunk).
     //  - "fresh": a balanceOfUnderlying() staticCall performed on every round.
     chunkCapSource: env.CHUNK_CAP_SOURCE === "fresh" ? "fresh" : "monitor",
+    // P3: watchdog WSS — détecte une connexion morte (plus aucun block reçu)
+    // et tente une reconnexion au lieu de rester figé silencieusement.
+    wssStallMs: env.WS_STALL_MS
+      ? Math.max(1_000, Number(env.WS_STALL_MS) || 0)
+      : 15_000, // Base émet un block toutes les ~2 s
+    wssCheckMs: env.WS_CHECK_MS
+      ? Math.max(1_000, Number(env.WS_CHECK_MS) || 0)
+      : 5_000,
+    wssMaxReconnects: env.WS_MAX_RECONNECTS
+      ? Math.max(1, Number(env.WS_MAX_RECONNECTS) || 0)
+      : 5, // budget de vie du process, puis process.exit(1)
+    // "reconnect" (défaut) ou "exit" : arrêt immédiat sur stall/fermeture,
+    // pour les déploiements pilotés par la politique de redémarrage Docker.
+    wssOnStall: env.WS_ON_STALL === "exit" ? "exit" : "reconnect",
   };
 }
 
@@ -164,6 +178,18 @@ function logStartupParameters(config, { walletAddress }, log = console) {
         : "désactivé"
     }`,
   );
+  log.log(
+    `  WSS watchdog     : silence ${config.wssStallMs / 1000} s | check ${
+      config.wssCheckMs / 1000
+    } s`,
+  );
+  log.log(
+    `  WSS reconnex     : ${config.wssOnStall}${
+      config.wssOnStall === "reconnect"
+        ? ` (max ${config.wssMaxReconnects} tentatives)`
+        : " (arrêt immédiat)"
+    }`,
+  );
   log.log(`  Gas tiers       : ${tierDesc}`);
   log.log("==================================================\n");
 }
@@ -253,6 +279,19 @@ function createChunkRunner({
   processExit = process.exit,
   readBalance, // async () => raw balance; required when cap source is "fresh"
 }) {
+  // P3: connexions actuelles — swappées par setConnection() lors d'une
+  // reconnexion WSS. mUsdcRead (lecture seule) n'est jamais rebâti.
+  let current = { mUsdc, mUsdcRead, provider };
+  const setConnection = (next) => {
+    if (next.mUsdc === current.mUsdc && next.provider === current.provider)
+      return; // no-op si inchangé
+    current = {
+      mUsdc: next.mUsdc,
+      provider: next.provider,
+      mUsdcRead: current.mUsdcRead,
+    };
+  };
+
   const minChunkRaw = ethers.parseUnits(
     config.minChunkUsdc.toString(),
     config.usdcDecimals,
@@ -299,8 +338,8 @@ function createChunkRunner({
         : "Target fully withdrawn. Done.",
     );
     state.stopped = true;
-    provider.removeAllListeners("block");
-    await provider.destroy();
+    current.provider.removeAllListeners("block");
+    await current.provider.destroy();
     processExit(0);
   };
 
@@ -345,12 +384,12 @@ function createChunkRunner({
       // 3) Liquidity on the market: free public RPC first, Alchemy fallback.
       let cash;
       try {
-        cash = await mUsdcRead.getCash();
+        cash = await current.mUsdcRead.getCash();
       } catch (readErr) {
         log.warn(
           `  -> Public RPC getCash() failed (${readErr.message || readErr}), falling back to Alchemy for this check.`,
         );
-        cash = await mUsdc.getCash();
+        cash = await current.mUsdc.getCash();
       }
 
       if (cash === 0n) {
@@ -401,7 +440,7 @@ function createChunkRunner({
         )} gwei, max=${ethers.formatUnits(maxFeePerGas, "gwei")} gwei`,
       );
 
-      const tx = await mUsdc.redeemUnderlying(chunk, {
+      const tx = await current.mUsdc.redeemUnderlying(chunk, {
         maxPriorityFeePerGas,
         maxFeePerGas,
       });
@@ -415,10 +454,10 @@ function createChunkRunner({
       const waitRes = await withTimeout(tx.wait(), config.txTimeoutMs);
       let receipt;
       if (waitRes.timedOut) {
-        const status = await getTxStatus(provider, tx.hash);
+        const status = await getTxStatus(current.provider, tx.hash);
         if (status === "mined") {
           // It mined just past our deadline — process the receipt normally.
-          receipt = await provider.getTransactionReceipt(tx.hash);
+          receipt = await current.provider.getTransactionReceipt(tx.hash);
         } else {
           log.warn(
             `  -> Tx ${tx.hash} still ${status} after ${config.txTimeoutMs / 1000}s — not mined. Giving up this round; nothing was decremented. Will retry next block.`,
@@ -442,7 +481,7 @@ function createChunkRunner({
       const failureEvent = receipt.logs
         .map((entry) => {
           try {
-            return mUsdc.interface.parseLog(entry);
+            return current.mUsdc.interface.parseLog(entry);
           } catch {
             return null;
           }
@@ -474,7 +513,7 @@ function createChunkRunner({
     }
   };
 
-  return { attemptChunk, state };
+  return { attemptChunk, state, setConnection };
 }
 
 /**
@@ -581,6 +620,164 @@ function createBalanceMonitor({
   return { start, read, stop };
 }
 
+/**
+ * P3 — Gardien de la connexion WSS Alchemy.
+ *
+ * Détecte un socket mort via un heartbeat (plus aucun block reçu depuis
+ * `silenceTimeoutMs`), signale immédiatement les événements "error" / "close"
+ * (URL masquée — jamais la clé API) et, en mode "reconnect" (défaut), déclenche
+ * `onReconnect()` — une fois par cycle de silence, pas à chaque tick — dans la
+ * limite du budget `maxReconnects` avant un `processExit(1)` propre. Avec
+ * `reconnect: false` (mode "exit" via WS_ON_STALL), tout stall ou close
+ * provoque l'arrêt immédiat.
+ *
+ * Tous les timers, l'horloge et la sortie processus sont injectés → testable
+ * sans vrai socket. `tick()` est alimenté par la souscription "block" interne
+ * (et peut être appelé de l'extérieur, notamment par les tests).
+ */
+function createWssWatchdog({
+  provider,
+  url = "",
+  log = console,
+  now = Date.now,
+  setTimer = setInterval,
+  clearTimer = clearInterval,
+  maskUrlFn = maskUrl,
+  silenceTimeoutMs = 15_000,
+  checkIntervalMs = 5_000,
+  maxReconnects = 5,
+  reconnect = true,
+  onReconnect = null, // async () => void — rebâti et re-souscrit (main)
+  shouldReconnect = () => true, // main injecte : !runner.state.txInFlight
+  processExit = process.exit,
+}) {
+  const state = {
+    socketDown: false, // close event, ou stall en cours
+    stallActive: false, // une escalade par cycle de silence
+    stallCount: 0, // cycles de silence depuis le dernier reset()
+    reconnectCount: 0, // budget cumulé — JAMAIS remis à zéro par reset()
+    lastBlockAt: now(),
+  };
+  let timer = null;
+  let exited = false;
+  let boundProvider = null;
+
+  const tick = () => {
+    state.lastBlockAt = now();
+    state.socketDown = false;
+  };
+  const myBlockHandler = () => tick();
+
+  const stop = () => {
+    if (timer) {
+      clearTimer(timer);
+      timer = null;
+    }
+    unbind();
+  };
+
+  const fatal = (msg) => {
+    if (exited) return; // ne jamais appeler process.exit deux fois
+    exited = true;
+    log.error(msg);
+    stop();
+    processExit(1);
+  };
+
+  const myErrorHandler = (err) => {
+    const detail = err && (err.code || err.message || "inconnue");
+    log.warn(
+      `  -> Connexion WSS : erreur détectée (${detail}). Le heartbeat reste actif.`,
+    );
+  };
+  const myCloseHandler = () => {
+    state.socketDown = true;
+    log.warn(
+      `  -> Connexion WSS fermée par le serveur (${
+        url ? maskUrlFn(url) : "URL non disponible"
+      }). Les events block sont interrompus.`,
+    );
+    if (!reconnect)
+      fatal("  -> WS_ON_STALL=exit — arrêt immédiat à la fermeture du WSS.");
+  };
+
+  const reset = () => {
+    state.lastBlockAt = now();
+    state.stallActive = false;
+    state.stallCount = 0;
+    state.socketDown = false; // on espère le nouveau socket
+    // reconnectCount volontairement conservé : budget de vie du process
+  };
+
+  const checkOnce = () => {
+    const idleMs = now() - state.lastBlockAt;
+    if (idleMs <= silenceTimeoutMs) {
+      state.socketDown = false;
+      state.stallActive = false;
+      return;
+    }
+    state.socketDown = true;
+    if (state.stallActive) return; // déjà escaladé ce cycle de silence
+    state.stallActive = true;
+    state.stallCount++;
+    const secs = Math.round(idleMs / 1000);
+
+    if (!reconnect)
+      return fatal(
+        `  -> Aucun block reçu depuis ${secs} s — WS_ON_STALL=exit, arrêt du bot.`,
+      );
+    if (
+      typeof onReconnect !== "function" ||
+      maxReconnects <= 0 ||
+      state.reconnectCount >= maxReconnects
+    )
+      return fatal(
+        `  -> Budget de reconnexions épuisé (max ${maxReconnects}) après ${secs} s sans block. Arrêt du bot.`,
+      );
+    if (!shouldReconnect()) {
+      log.warn(
+        `  -> Aucun block depuis ${secs} s — une transaction est en cours, reconnexion différée (budget non consommé).`,
+      );
+      return reset(); // ré-arme → retente au cycle suivant
+    }
+
+    state.reconnectCount++;
+    log.warn(
+      `  -> Aucun block reçu depuis ${secs} s — tentative de reconnexion ${state.reconnectCount}/${maxReconnects}...`,
+    );
+    Promise.resolve()
+      .then(() => onReconnect())
+      .then(reset, (err) => {
+        log.error(
+          `  -> Échec de la reconnexion: ${(err && err.message) || err}`,
+        );
+        reset();
+      });
+  };
+
+  const unbind = () => {
+    if (!boundProvider) return;
+    boundProvider.off?.("block", myBlockHandler);
+    boundProvider.off?.("error", myErrorHandler);
+    boundProvider.websocket?.off?.("close", myCloseHandler);
+    boundProvider = null;
+  };
+  const bind = (next) => {
+    if (next === boundProvider) return; // inert
+    unbind();
+    boundProvider = next;
+    next.on?.("block", myBlockHandler);
+    next.on?.("error", myErrorHandler);
+    next.websocket?.on?.("close", myCloseHandler);
+  };
+  const setProvider = (next) => bind(next); // utilisé par main() après rebuild
+
+  bind(provider);
+  timer = setTimer(checkOnce, checkIntervalMs); // heartbeat démarré à la création
+
+  return { tick, reset, stop, setProvider, state };
+}
+
 // ---------- Entry point ----------
 
 async function main() {
@@ -595,9 +792,19 @@ async function main() {
     );
   }
 
-  const provider = new ethers.WebSocketProvider(config.wssUrl);
-  const wallet = new ethers.Wallet(config.privateKey, provider);
-  const mUsdc = new ethers.Contract(config.mUsdcAddress, MTOKEN_ABI, wallet);
+  // P3: fabrique la triade provider/wallet/contrat sur le WSS Alchemy.
+  function buildWss() {
+    const p = new ethers.WebSocketProvider(config.wssUrl);
+    const w = new ethers.Wallet(config.privateKey, p);
+    const m = new ethers.Contract(config.mUsdcAddress, MTOKEN_ABI, w);
+    return { provider: p, wallet: w, mUsdc: m };
+  }
+  // P3: souscrit le runner aux blocks. Rejoué après chaque reconnexion.
+  const subscribe = (p) => {
+    p.on("block", attemptChunk); // attemptChunk est résolu à l'APPEL, pas ici
+  };
+
+  let { provider, wallet, mUsdc } = buildWss();
 
   // Separate read-only provider for the high-frequency getCash() checks —
   // keeps that load off the paid Alchemy connection. Block subscription and
@@ -702,10 +909,43 @@ async function main() {
     );
   }
 
+  // P3: watchdog WSS — heartbeat (plus aucun block depuis wssStallMs) + rebind.
+  // La reconnexion est différée tant qu'une tx est en vol : le vieux socket
+  // porte encore le wait/getTxStatus P1, le détruire casserait cette gestion.
+  const reconnectHandler = async () => {
+    try {
+      await provider.destroy();
+    } catch {
+      /* socket déjà mort */
+    }
+    provider.removeAllListeners?.("block");
+    const fresh = buildWss();
+    runner.setConnection({ mUsdc: fresh.mUsdc, provider: fresh.provider });
+    subscribe(fresh.provider); // AVANT de reprendre les blocks
+    provider = fresh.provider; // le `let` scope main est recâblé
+    wallet = fresh.wallet;
+    mUsdc = fresh.mUsdc;
+    watchdog.setProvider(fresh.provider);
+    watchdog.reset(); // ré-arme l'horloge du heartbeat
+    console.log(
+      "Reconnexion WSS établie — surveillance des blocks relancée.\n",
+    );
+  };
+  const watchdog = createWssWatchdog({
+    provider,
+    url: config.wssUrl,
+    silenceTimeoutMs: config.wssStallMs,
+    checkIntervalMs: config.wssCheckMs,
+    maxReconnects: config.wssMaxReconnects,
+    reconnect: config.wssOnStall !== "exit",
+    onReconnect: reconnectHandler,
+    shouldReconnect: () => !runner.state.txInFlight,
+  });
+
   console.log(
     "Subscribing to new blocks — will check liquidity on each one.\n",
   );
-  provider.on("block", attemptChunk);
+  subscribe(provider);
   attemptChunk(); // run immediately on start, don't wait for the first block
 }
 
@@ -734,4 +974,5 @@ module.exports = {
   createChunkRunner,
   createBalanceWiring,
   createBalanceMonitor,
+  createWssWatchdog,
 };

@@ -9,7 +9,7 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 ## Structure du projet
 
 - **`moonwell-withdraw-bot-chunked.js`** — Le bot complet (fichier unique)
-- **`tests/bot.test.js`** — Tests unitaires (`node --test`), 50 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
+- **`tests/bot.test.js`** — Tests unitaires (`node --test`), 63 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
 - **`README.md`** — Documentation utilisateur
 
 ## Stack technique
@@ -71,7 +71,7 @@ node --test        # ou: yarn test
 node --check moonwell-withdraw-bot-chunked.js   # vérification syntaxe
 ```
 
-Les fonctions pures (`loadConfig`, `getGasForChunk`, `withTimeout`, `getTxStatus`, `computeChunk`) et le runner (`createChunkRunner`, avec état `state.{stopped,txInFlight,processedRaw,knownBalanceRaw,remainingRaw}`) sont exportés par le fichier précisément pour être testables. Le helper `createBalanceWiring` est également exporté pour connecter le moniteur de balance au runner. Les tests couvrent les correctifs **P1** et **P2** ainsi que le modèle de re-sync du solde : mode solde complet, réaction aux dépôts/ retraits externes, garde anti-double-compte, bascule monitor→fresh.
+Les fonctions pures (`loadConfig`, `getGasForChunk`, `withTimeout`, `getTxStatus`, `computeChunk`) et le runner (`createChunkRunner`, avec état `state.{stopped,txInFlight,processedRaw,knownBalanceRaw,remainingRaw}`) sont exportés par le fichier précisément pour être testables. Le helper `createBalanceWiring` est également exporté pour connecter le moniteur de balance au runner. Les tests couvrent les correctifs **P1**, **P2** et **P3** (watchdog WSS + reconnexion) ainsi que le modèle de re-sync du solde : mode solde complet, réaction aux dépôts/ retraits externes, garde anti-double-compte, bascule monitor→fresh.
 
 Pour exécuter le bot :
 
@@ -85,6 +85,7 @@ Attention : le script soumet de vraies transactions on-chain. Ne l'exécuter que
 
 - **P1** — `tx.wait()` encadré par `withTimeout()` (`TX_TIMEOUT_MS`, défaut 60 s). Au timeout, `getTxStatus()` donne le statut réel : `pending`/`dropped` → warning + reprise au bloc suivant sans décrémenter ; `mined` → receipt traité normalement.
 - **P2** — `txInFlight = true` posé immédiatement après le garde, avant tout `await`, pour éviter la double soumission au même nonce.
+- **P3 (11/09/2026)** — `createWssWatchdog()` surveille le WSS Alchemy : heartbeat + seuil de silence (`WS_STALL_MS`) détectent une coupure, les events `error`/`close` sont loggés (URL masquée via `maskUrl`, jamais de clé), et la reconnexion reconstruit le provider (`buildWss`) puis rebranche la souscription `block` via `runner.setConnection`. Comportement piloté par `WS_ON_STALL` (`reconnect` par défaut / `exit`) avec un budget `WS_MAX_RECONNECTS` ; reconnexion différée tant qu'une tx est en vol.
 - **Diagnostics au démarrage** — `logStartupParameters()` affiche mUSDC_ADDRESS (avec lien BaseScan), wallet, WSS masqué, RPC, paliers de gaz, etc. Un solde nul déclenche un indice explicite (« vérifiez MUSDC_ADDRESS »).
 - **Surveillance du solde** — `createBalanceMonitor()` relit le solde décomposable sur le RPC de lecture toutes les `BALANCE_MONITOR_INTERVAL` s (défaut 60 s, `0` pour désactiver) et log les changements externes (dépôts, retraits manuels, intérêts).
 - **Re-synchronisation du solde (11/09/2026)** — le moniteur alimente désormais la logique de retrait via `createBalanceWiring()` : `remainingRaw` est un getter dérivé de `targetRaw - processedRaw` (mode cible fixe) ou de `knownBalanceRaw` (mode solde complet). Les dépôts externes sont retirés automatiquement, un retrait manuel réduit la cible. Garde anti-double-compte : une lecture du moniteur n'écrase `knownBalanceRaw` que si `!txInFlight`. `CHUNK_CAP_SOURCE` (`monitor`/`fresh`) choisit la source du plafond de chunk — sans moniteur, bascule automatique en `fresh` avec warning.
