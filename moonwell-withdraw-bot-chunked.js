@@ -60,6 +60,13 @@ function loadConfig(env = process.env) {
     // P1: cap on how long we wait for a transaction to be mined before giving
     // up this round (see `withTimeout`).
     txTimeoutMs: Number(env.TX_TIMEOUT_MS) || 60_000,
+    // Periodic re-read of the redeemable balance (see createBalanceMonitor) so
+    // external changes (deposits, partial withdrawals, interest accrual) stay
+    // visible. Default 60 s; set to 0 to disable.
+    balanceMonitorIntervalMs:
+      env.BALANCE_MONITOR_INTERVAL !== undefined
+        ? Number(env.BALANCE_MONITOR_INTERVAL) || 0
+        : 60_000,
   };
 }
 
@@ -143,6 +150,13 @@ function logStartupParameters(config, { walletAddress }, log = console) {
   log.log(`  WITHDRAW_AMOUNT : ${targetDesc}`);
   log.log(`  MIN_CHUNK       : ${config.minChunkUsdc}`);
   log.log(`  TX timeout      : ${config.txTimeoutMs / 1000} s`);
+  log.log(
+    `  Balance monitor : ${
+      config.balanceMonitorIntervalMs > 0
+        ? `toutes les ${config.balanceMonitorIntervalMs / 1000} s`
+        : "désactivé"
+    }`,
+  );
   log.log(`  Gas tiers       : ${tierDesc}`);
   log.log("==================================================\n");
 }
@@ -370,6 +384,76 @@ function createChunkRunner({
   return { attemptChunk, state };
 }
 
+/**
+ * Periodically re-reads the redeemable balance (a single cheap staticCall on
+ * the free read RPC) and logs it, highlighting changes that did not come from
+ * this bot — extra deposits, manual partial withdrawals, interest accrual…
+ *
+ * It only LOGS; it never alters the withdrawal logic. Disabled when intervalMs
+ * <= 0. `setTimer`/`clearTimer` are injectable so tests can drive it without
+ * real timers. `read()` is the public read+log step (also run by the timer).
+ */
+function createBalanceMonitor({
+  mUsdcRead,
+  walletAddress,
+  intervalMs,
+  log = console,
+  initialRaw = null,
+  setTimer = setInterval,
+  clearTimer = clearInterval,
+}) {
+  let lastRaw = initialRaw;
+  let failures = 0;
+  let timer = null;
+
+  const stop = () => {
+    if (timer) clearTimer(timer);
+    timer = null;
+  };
+
+  const read = async () => {
+    try {
+      // .staticCall() forces eth_call — read-only, no signer needed.
+      const raw = await mUsdcRead.balanceOfUnderlying.staticCall(walletAddress);
+      failures = 0;
+      const ts = new Date().toISOString();
+      if (lastRaw !== null && raw !== lastRaw) {
+        const delta = raw - lastRaw;
+        const sign = delta > 0n ? "+" : "-";
+        const abs = delta < 0n ? -delta : delta;
+        log.log(
+          `[${ts}] [balance] ${fmt(raw)} USDC (${sign}${fmt(
+            abs,
+          )} USDC depuis la dernière lecture — changement externe)`,
+        );
+      } else {
+        log.log(`[${ts}] [balance] ${fmt(raw)} USDC (inchangé)`);
+      }
+      lastRaw = raw;
+    } catch (err) {
+      failures++;
+      const giveUp = failures >= 5;
+      log.warn(
+        `  -> balance read failed (${err.message || err})${
+          giveUp ? " — moniteur de solde arrêté après erreurs répétées." : ""
+        }`,
+      );
+      if (giveUp) stop();
+    }
+  };
+
+  const start = () => {
+    if (intervalMs > 0) {
+      timer = setTimer(() => {
+        read().catch(() => {});
+      }, intervalMs);
+    }
+    return { stop };
+  };
+
+  return { start, read, stop };
+}
+
 // ---------- Entry point ----------
 
 async function main() {
@@ -439,6 +523,22 @@ async function main() {
     initialRemainingRaw: remainingRaw,
   });
 
+  // Balance monitor: re-reads the redeemable balance every
+  // config.balanceMonitorIntervalMs and logs external changes. Read-only — it
+  // never submits anything. Its baseline is the balance read at startup.
+  if (config.balanceMonitorIntervalMs > 0) {
+    const monitor = createBalanceMonitor({
+      mUsdcRead,
+      walletAddress: wallet.address,
+      intervalMs: config.balanceMonitorIntervalMs,
+      initialRaw: startingBalanceRaw,
+    });
+    monitor.start();
+    console.log(
+      `Balance monitor ON — solde décomposable relu toutes les ${config.balanceMonitorIntervalMs / 1000} s (changements externes loggés).\n`,
+    );
+  }
+
   console.log(
     "Subscribing to new blocks — will check liquidity on each one.\n",
   );
@@ -469,4 +569,5 @@ module.exports = {
   getTxStatus,
   computeChunk,
   createChunkRunner,
+  createBalanceMonitor,
 };

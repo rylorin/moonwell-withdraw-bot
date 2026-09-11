@@ -31,6 +31,7 @@ const {
   getTxStatus,
   computeChunk,
   createChunkRunner,
+  createBalanceMonitor,
   DEFAULT_GAS_TIERS,
 } = bot;
 
@@ -179,6 +180,7 @@ test("loadConfig applies its defaults", () => {
   assert.equal(c.txTimeoutMs, 60000);
   assert.equal(c.usdcDecimals, 6);
   assert.equal(c.gasTiers, DEFAULT_GAS_TIERS);
+  assert.equal(c.balanceMonitorIntervalMs, 60000, "default: monitor every 60 s");
 });
 
 test("loadConfig reads values from the env map", () => {
@@ -190,6 +192,7 @@ test("loadConfig reads values from the env map", () => {
     WITHDRAW_AMOUNT: "70000.5",
     MIN_CHUNK: "2",
     TX_TIMEOUT_MS: "5000",
+    BALANCE_MONITOR_INTERVAL: "120",
   });
   assert.equal(c.wssUrl, "wss://alchemy.example/v2/abc");
   assert.equal(c.readRpcUrl, "https://rpc.example");
@@ -198,6 +201,12 @@ test("loadConfig reads values from the env map", () => {
   assert.equal(c.totalTarget, 70000.5);
   assert.equal(c.minChunkUsdc, 2);
   assert.equal(c.txTimeoutMs, 5000);
+  assert.equal(c.balanceMonitorIntervalMs, 120);
+});
+
+test("loadConfig: balance monitor can be disabled with 0", () => {
+  const c = loadConfig({ BALANCE_MONITOR_INTERVAL: "0" });
+  assert.equal(c.balanceMonitorIntervalMs, 0);
 });
 
 test("checkPlaceholders flags missing secrets", () => {
@@ -546,4 +555,105 @@ test("P1: a second attempt after a timeout submits a new tx (bot recovered)", as
   assert.equal(d.calls.redeem, 2, "bot retries the next block");
   assert.equal(d.runner.state.remainingRaw, parse("400"));
   assert.equal(d.runner.state.txInFlight, false);
+});
+
+// ---------------------------------------------------------------------------
+// createBalanceMonitor — periodic re-read of the redeemable balance
+// ---------------------------------------------------------------------------
+
+/** Build a monitor with captured logs. `failingRead: true` makes reads throw. */
+function makeMonitor(overrides = {}) {
+  const logs = [];
+  const warns = [];
+  const log = {
+    log: (msg) => logs.push(String(msg)),
+    warn: (msg) => warns.push(String(msg)),
+    error: () => {},
+  };
+  const balanceOf = overrides.failingRead
+    ? async () => {
+        throw new Error("rpc down");
+      }
+    : async () => overrides.balance ?? parse("100");
+  const mUsdcRead = {
+    balanceOfUnderlying: { staticCall: balanceOf },
+  };
+  const monitor = createBalanceMonitor({
+    mUsdcRead,
+    walletAddress: "0xWallet",
+    intervalMs: overrides.intervalMs ?? 60_000,
+    initialRaw: overrides.initialRaw ?? parse("100"),
+    log,
+    setTimer: overrides.setTimer ?? (() => "TIMER"),
+    clearTimer: overrides.clearTimer ?? (() => {}),
+  });
+  return { monitor, logs, warns, mUsdcRead };
+}
+
+test("balance monitor: unchanged balance logs a stable message", async () => {
+  const { monitor, logs } = makeMonitor({ balance: parse("100") });
+  await monitor.read();
+  assert.equal(logs.length, 1);
+  assert.ok(logs[0].includes("inchangé"));
+  assert.ok(logs[0].includes("100"));
+});
+
+test("balance monitor: a balance increase is flagged as an external change", async () => {
+  // baseline logged first (no delta), then the change
+  const { monitor, logs, mUsdcRead } = makeMonitor({});
+  mUsdcRead.balanceOfUnderlying.staticCall = async () => parse("120");
+  await monitor.read();
+  assert.equal(logs.length, 1);
+  assert.ok(logs[0].includes("+20"));
+  assert.ok(logs[0].includes("changement externe"));
+});
+
+test("balance monitor: a balance decrease is flagged with a minus sign", async () => {
+  const { monitor, logs, mUsdcRead } = makeMonitor({
+    initialRaw: parse("100"),
+  });
+  mUsdcRead.balanceOfUnderlying.staticCall = async () => parse("90");
+  await monitor.read();
+  assert.ok(logs[0].includes("-10"));
+});
+
+test("balance monitor: disabled when interval is 0 (no timer started)", () => {
+  const { monitor } = makeMonitor({
+    intervalMs: 0,
+    setTimer: () => {
+      throw new Error("setTimer must not be called when disabled");
+    },
+  });
+  // must not throw
+  monitor.start();
+});
+
+test("balance monitor: start() schedules reads on the injected timer", () => {
+  let captured = null;
+  let ms = -1;
+  const { monitor } = makeMonitor({
+    setTimer: (cb, delay) => {
+      captured = cb;
+      ms = delay;
+      return "TMR";
+    },
+  });
+  monitor.start();
+  assert.equal(typeof captured, "function");
+  assert.equal(ms, 60_000);
+});
+
+test("balance monitor: repeated read failures warn and stop the monitor", async () => {
+  let cleared = 0;
+  const { monitor, warns } = makeMonitor({
+    failingRead: true,
+    clearTimer: () => {
+      cleared++;
+    },
+  });
+  monitor.start();
+  for (let i = 0; i < 5; i++) await monitor.read();
+  assert.equal(warns.length, 5);
+  assert.ok(warns.some((w) => /arrêté/.test(w)), "monitor must announce it stops");
+  assert.equal(cleared, 1, "timer must be cleared once when giving up");
 });
