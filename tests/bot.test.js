@@ -13,6 +13,9 @@
  *  - P1: bounded tx.wait() — a tx that never mines must NOT stall the bot
  *  - P2: the txInFlight guard is held before the first await — two concurrent
  *        attemptChunk() calls must submit exactly one tx
+ *  - re-sync: the chunk is capped at the known balance; in full-balance mode
+ *        remainingRaw derives from the balance, so external deposits are
+ *        picked up and manual withdrawals shrink the goal naturally.
  */
 
 const { test } = require("node:test");
@@ -31,6 +34,7 @@ const {
   getTxStatus,
   computeChunk,
   createChunkRunner,
+  createBalanceWiring,
   createBalanceMonitor,
   DEFAULT_GAS_TIERS,
 } = bot;
@@ -45,6 +49,10 @@ const parse = (v) => ethers.parseUnits(String(v), 6);
  * Build a fully mocked runner environment. Override any behaviour via
  * `overrides` — see each test for the supported keys:
  *  - targetUsd / minChunkUsdc / txTimeoutMs : config values
+ *  - fullBalance     : omit WITHDRAW_AMOUNT → full-balance mode
+ *  - initialBalanceUsd : the known balance (chunk cap) seed
+ *  - chunkCapSource / balanceInterval : CHUNK_CAP_SOURCE / BALANCE_MONITOR_INTERVAL
+ *  - readBalance / freshBalance : the 'fresh' cap-source reader
  *  - cash            : what getCash() returns (raw BigInt or human number)
  *  - failPublicGetCash : make the public RPC read throw (tests the fallback)
  *  - txWait          : what tx.wait() does (fn) — default resolves a receipt
@@ -135,18 +143,36 @@ function makeDeps(overrides = {}) {
     calls.exit++;
   };
 
-  const config = loadConfig({
-    WITHDRAW_AMOUNT: String(overrides.targetUsd ?? 500),
+  const env = {
+    WITHDRAW_AMOUNT: overrides.fullBalance
+      ? undefined
+      : String(overrides.targetUsd ?? 500),
     MIN_CHUNK: String(overrides.minChunkUsdc ?? 5),
     TX_TIMEOUT_MS: String(overrides.txTimeoutMs ?? 60),
-  });
+  };
+  if (overrides.chunkCapSource) env.CHUNK_CAP_SOURCE = overrides.chunkCapSource;
+  if (overrides.balanceInterval !== undefined)
+    env.BALANCE_MONITOR_INTERVAL = String(overrides.balanceInterval);
+  const config = loadConfig(env);
+
+  // The "known balance" seeds the chunk cap; in full-balance mode (no target)
+  // it is also the remaining amount, since remainingRaw ≡ knownBalanceRaw.
+  const initialBalUsd = overrides.fullBalance
+    ? overrides.initialBalanceUsd ?? 100
+    : overrides.initialBalanceUsd ?? overrides.targetUsd ?? 500;
+  const initialBalanceRaw = parse(String(initialBalUsd));
+
+  const readBalance =
+    overrides.readBalance ??
+    (async () => parse(String(overrides.freshBalance ?? initialBalUsd)));
 
   const runner = createChunkRunner({
     mUsdc,
     mUsdcRead,
     provider,
     config,
-    initialRemainingRaw: parse(overrides.targetUsd ?? 500),
+    initialBalanceRaw,
+    readBalance,
     log,
     processExit,
   });
@@ -181,6 +207,7 @@ test("loadConfig applies its defaults", () => {
   assert.equal(c.usdcDecimals, 6);
   assert.equal(c.gasTiers, DEFAULT_GAS_TIERS);
   assert.equal(c.balanceMonitorIntervalMs, 60000, "default: monitor every 60 s");
+  assert.equal(c.chunkCapSource, "monitor");
 });
 
 test("loadConfig reads values from the env map", () => {
@@ -193,6 +220,7 @@ test("loadConfig reads values from the env map", () => {
     MIN_CHUNK: "2",
     TX_TIMEOUT_MS: "5000",
     BALANCE_MONITOR_INTERVAL: "120",
+    CHUNK_CAP_SOURCE: "fresh",
   });
   assert.equal(c.wssUrl, "wss://alchemy.example/v2/abc");
   assert.equal(c.readRpcUrl, "https://rpc.example");
@@ -202,11 +230,17 @@ test("loadConfig reads values from the env map", () => {
   assert.equal(c.minChunkUsdc, 2);
   assert.equal(c.txTimeoutMs, 5000);
   assert.equal(c.balanceMonitorIntervalMs, 120);
+  assert.equal(c.chunkCapSource, "fresh");
 });
 
 test("loadConfig: balance monitor can be disabled with 0", () => {
   const c = loadConfig({ BALANCE_MONITOR_INTERVAL: "0" });
   assert.equal(c.balanceMonitorIntervalMs, 0);
+});
+
+test("loadConfig: an unknown CHUNK_CAP_SOURCE falls back to monitor", () => {
+  const c = loadConfig({ CHUNK_CAP_SOURCE: "bogus" });
+  assert.equal(c.chunkCapSource, "monitor");
 });
 
 test("checkPlaceholders flags missing secrets", () => {
@@ -244,6 +278,7 @@ test("logStartupParameters prints the mUSDC address and key values", () => {
   assert.ok(all.includes("0xWallet"), "wallet address must be visible");
   assert.ok(all.includes("700 USDC"), "target must be shown");
   assert.ok(all.includes("MIN_CHUNK"));
+  assert.ok(all.includes("CHUNK_CAP_SOURCE"));
 });
 
 // ---------------------------------------------------------------------------
@@ -349,6 +384,17 @@ test("computeChunk returns zero for zero cash", () => {
   assert.equal(r.belowMin, false);
 });
 
+test("computeChunk caps the chunk at the known balance when it is smallest", () => {
+  const r = computeChunk(parse("1000"), parse("300"), parse("5"), parse("50"));
+  assert.equal(r.amount, parse("50"));
+  assert.equal(r.belowMin, false);
+});
+
+test("computeChunk leaves the chunk alone when the balance cap is omitted", () => {
+  const r = computeChunk(parse("1000"), parse("300"), parse("5"));
+  assert.equal(r.amount, parse("300"));
+});
+
 // ---------------------------------------------------------------------------
 // createChunkRunner — happy paths
 // ---------------------------------------------------------------------------
@@ -358,6 +404,8 @@ test("runner: a successful chunk decrements remainingRaw and frees the guard", a
   await d.runner.attemptChunk();
 
   assert.equal(d.calls.redeem, 1);
+  assert.equal(d.runner.state.processedRaw, parse("100"));
+  assert.equal(d.runner.state.knownBalanceRaw, parse("400"));
   assert.equal(d.runner.state.remainingRaw, parse("400"));
   assert.equal(d.runner.state.txInFlight, false);
   assert.equal(d.warns.length, 0);
@@ -421,6 +469,8 @@ test("runner: completing the target exits cleanly", async () => {
   const d = makeDeps({ targetUsd: 100, cash: 100 });
   await d.runner.attemptChunk();
 
+  assert.equal(d.runner.state.processedRaw, parse("100"));
+  assert.equal(d.runner.state.knownBalanceRaw, 0n);
   assert.equal(d.runner.state.remainingRaw, 0n);
   assert.equal(d.runner.state.stopped, true);
   assert.equal(d.calls.exit, 1);
@@ -558,6 +608,143 @@ test("P1: a second attempt after a timeout submits a new tx (bot recovered)", as
 });
 
 // ---------------------------------------------------------------------------
+// Re-synchro solde → chunk (mode solde complet et cible fixe)
+// ---------------------------------------------------------------------------
+
+test("runner: full-balance mode — remainingRaw derives from the known balance", async () => {
+  const d = makeDeps({ fullBalance: true, cash: 40 });
+  await d.runner.attemptChunk();
+
+  assert.equal(d.calls.redeem, 1);
+  assert.equal(d.runner.state.processedRaw, parse("40"));
+  assert.equal(d.runner.state.knownBalanceRaw, parse("60"));
+  assert.equal(
+    d.runner.state.remainingRaw,
+    parse("60"),
+    "remaining ≡ known balance in full mode",
+  );
+  assert.equal(d.runner.state.stopped, false, "still 60 to go");
+});
+
+test("runner: full-balance mode stops when the balance reaches zero", async () => {
+  const d = makeDeps({ fullBalance: true, cash: 100 });
+  await d.runner.attemptChunk();
+
+  assert.equal(d.calls.redeem, 1);
+  assert.equal(d.runner.state.processedRaw, parse("100"));
+  assert.equal(d.runner.state.knownBalanceRaw, 0n);
+  assert.equal(d.runner.state.remainingRaw, 0n);
+  assert.equal(d.runner.state.stopped, true);
+  assert.equal(d.calls.exit, 1);
+});
+
+test("runner: full-balance mode with a zero balance is done immediately", async () => {
+  const d = makeDeps({ fullBalance: true, initialBalanceUsd: 0, cash: 100 });
+  await d.runner.attemptChunk();
+
+  assert.equal(d.calls.redeem, 0);
+  assert.equal(d.runner.state.remainingRaw, 0n);
+  assert.equal(d.runner.state.stopped, true);
+  assert.equal(d.calls.exit, 1);
+});
+
+test("balance wiring: a monitor read updates knownBalance when idle but is ignored while a chunk is in flight", async () => {
+  const d = makeDeps({ targetUsd: 500 });
+  const wiring = createBalanceWiring(d.runner);
+
+  wiring(parse("130")); // idle → external deposit picked up
+  assert.equal(d.runner.state.knownBalanceRaw, parse("130"));
+
+  d.runner.state.txInFlight = true;
+  wiring(parse("999")); // in-flight → must NOT overwrite (can't know if our tx mined)
+  assert.equal(d.runner.state.knownBalanceRaw, parse("130"));
+
+  d.runner.state.txInFlight = false;
+  await d.runner.attemptChunk(); // known 130, target 500, cash 100
+  assert.equal(d.runner.state.processedRaw, parse("100"));
+  assert.equal(d.runner.state.knownBalanceRaw, parse("30"));
+});
+
+test("runner: full-balance mode — an external deposit is withdrawn on later rounds", async () => {
+  const d = makeDeps({ fullBalance: true, cash: 40 });
+  await d.runner.attemptChunk();
+  assert.equal(d.runner.state.remainingRaw, parse("60"));
+
+  // External deposit of +50 while idle, pushed as the monitor would:
+  createBalanceWiring(d.runner)(parse("110"));
+  assert.equal(
+    d.runner.state.remainingRaw,
+    parse("110"),
+    "full mode follows the balance",
+  );
+
+  d.mUsdcRead.getCash = async () => parse("100");
+  d.mUsdc.getCash = async () => parse("100");
+  await d.runner.attemptChunk();
+
+  assert.equal(d.runner.state.processedRaw, parse("140")); // 40 + 100
+  assert.equal(d.runner.state.knownBalanceRaw, parse("10"));
+  assert.equal(d.runner.state.remainingRaw, parse("10"));
+  assert.equal(d.runner.state.stopped, false);
+});
+
+test("runner: fixed target — external withdrawal drops the balance; chunk is capped at it and the bot keeps going", async () => {
+  const d = makeDeps({ targetUsd: 500, cash: 100 });
+  // Monitor read while idle: the balance fell to 30 (manual withdrawal).
+  createBalanceWiring(d.runner)(parse("30"));
+
+  d.mUsdcRead.getCash = async () => parse("50");
+  d.mUsdc.getCash = async () => parse("50");
+  await d.runner.attemptChunk();
+
+  assert.equal(d.calls.redeem, 1);
+  assert.equal(
+    d.runner.state.processedRaw,
+    parse("30"),
+    "chunk capped at the balance",
+  );
+  assert.equal(d.runner.state.remainingRaw, parse("470"), "target − processed");
+  assert.equal(d.runner.state.knownBalanceRaw, 0n);
+  assert.equal(d.runner.state.stopped, false, "keeps trying — target not reached");
+});
+
+test("runner: CHUNK_CAP_SOURCE=fresh reads the balance every round and caps the chunk", async () => {
+  const d = makeDeps({
+    targetUsd: 500,
+    cash: 100,
+    chunkCapSource: "fresh",
+    freshBalance: 80,
+  });
+  await d.runner.attemptChunk();
+
+  assert.equal(d.runner.state.capSource, "fresh");
+  assert.equal(d.runner.state.processedRaw, parse("80"));
+  assert.equal(
+    d.runner.state.knownBalanceRaw,
+    0n,
+    "fresh 80 fully redeemed in this round",
+  );
+  assert.equal(d.runner.state.remainingRaw, parse("420"));
+});
+
+test("runner: cap source 'monitor' with the monitor disabled falls back to fresh", async () => {
+  const d = makeDeps({
+    targetUsd: 500,
+    cash: 100,
+    chunkCapSource: "monitor",
+    balanceInterval: 0,
+  });
+  assert.equal(d.runner.state.capSource, "fresh");
+  assert.ok(
+    d.warns.some((w) => /falling back to reading the balance fresh/i.test(w)),
+    "must warn that it fell back",
+  );
+  // It still caps the chunk off a fresh read:
+  await d.runner.attemptChunk();
+  assert.equal(d.runner.state.processedRaw, parse("100"));
+});
+
+// ---------------------------------------------------------------------------
 // createBalanceMonitor — periodic re-read of the redeemable balance
 // ---------------------------------------------------------------------------
 
@@ -584,6 +771,8 @@ function makeMonitor(overrides = {}) {
     intervalMs: overrides.intervalMs ?? 60_000,
     initialRaw: overrides.initialRaw ?? parse("100"),
     log,
+    onBalanceRead: overrides.onBalanceRead ?? (() => {}),
+    lpDecimals: overrides.lpDecimals ?? null,
     setTimer: overrides.setTimer ?? (() => "TIMER"),
     clearTimer: overrides.clearTimer ?? (() => {}),
   });
@@ -643,6 +832,16 @@ test("balance monitor: start() schedules reads on the injected timer", () => {
   assert.equal(ms, 60_000);
 });
 
+test("balance monitor: onBalanceRead receives each successful read", async () => {
+  const seen = [];
+  const { monitor } = makeMonitor({
+    balance: parse("77"),
+    onBalanceRead: (raw) => seen.push(raw),
+  });
+  await monitor.read();
+  assert.deepEqual(seen, [parse("77")]);
+});
+
 test("balance monitor: repeated read failures warn and stop the monitor", async () => {
   let cleared = 0;
   const { monitor, warns } = makeMonitor({
@@ -656,4 +855,24 @@ test("balance monitor: repeated read failures warn and stop the monitor", async 
   assert.equal(warns.length, 5);
   assert.ok(warns.some((w) => /arrêté/.test(w)), "monitor must announce it stops");
   assert.equal(cleared, 1, "timer must be cleared once when giving up");
+});
+
+test("balance monitor: LP-token balance appears on the balance line", async () => {
+  const { monitor, logs, mUsdcRead } = makeMonitor({
+    balance: parse("100"),
+    lpDecimals: 6,
+  });
+  mUsdcRead.balanceOf = { staticCall: async () => parse("100") };
+  await monitor.read();
+  assert.ok(
+    logs[0].includes("| LP tokens: 100.0"),
+    "LP-token balance formatted with lpDecimals",
+  );
+});
+
+test("balance monitor: a failing LP read degrades to n/a without killing the read", async () => {
+  const { monitor, logs } = makeMonitor({ balance: parse("100"), lpDecimals: 6 });
+  await monitor.read();
+  assert.ok(logs[0].includes("| LP tokens: n/a"));
+  assert.ok(logs[0].includes("USDC"), "underlying balance line still logged");
 });

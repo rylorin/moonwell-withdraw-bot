@@ -14,8 +14,7 @@
  * - This script needs your PRIVATE KEY to sign transactions. Set it via
  *   an environment variable — never hardcode it in this file or share it.
  * - Only run this against a wallet you control, on a machine you trust.
- * - Contract address verified on BaseScan:
- *   https://basescan.org/address/0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22
+ * - Contract address verified on BaseScan.
  *
  * The module exports its pure logic (loadConfig, getGasForChunk, withTimeout,
  * createChunkRunner, ...) so it can be unit-tested; when executed directly it
@@ -67,6 +66,11 @@ function loadConfig(env = process.env) {
       env.BALANCE_MONITOR_INTERVAL !== undefined
         ? Number(env.BALANCE_MONITOR_INTERVAL) || 0
         : 60_000,
+    // Where the per-round "available balance" cap for the redeem chunk comes from:
+    //  - "monitor" (default): the value the balance monitor last read (up to one
+    //    monitor interval old, then corrected by each confirmed chunk).
+    //  - "fresh": a balanceOfUnderlying() staticCall performed on every round.
+    chunkCapSource: env.CHUNK_CAP_SOURCE === "fresh" ? "fresh" : "monitor",
   };
 }
 
@@ -95,6 +99,8 @@ function fmt(raw) {
 const MTOKEN_ABI = [
   "function getCash() view returns (uint256)",
   "function balanceOfUnderlying(address owner) returns (uint256)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)",
   "function redeemUnderlying(uint256 redeemAmount) returns (uint256)",
   "event Failure(uint256 errorCode, uint256 info, uint256 detail)",
 ];
@@ -149,6 +155,7 @@ function logStartupParameters(config, { walletAddress }, log = console) {
   log.log(`  USDC decimals   : ${config.usdcDecimals}`);
   log.log(`  WITHDRAW_AMOUNT : ${targetDesc}`);
   log.log(`  MIN_CHUNK       : ${config.minChunkUsdc}`);
+  log.log(`  CHUNK_CAP_SOURCE: ${config.chunkCapSource}`);
   log.log(`  TX timeout      : ${config.txTimeoutMs / 1000} s`);
   log.log(
     `  Balance monitor : ${
@@ -208,53 +215,134 @@ async function getTxStatus(provider, hash) {
 }
 
 /**
- * The chunk = min(available cash, remaining target). Returns `{ amount,
- * belowMin }` as raw BigInts. Pure → unit-testable.
+ * The chunk = min(available cash, remaining target, known balance). The last
+ * cap (`balanceRaw`) is optional so callers without a balance source keep the
+ * old behaviour; on-chain amounts are raw BigInts. Pure → unit-testable.
  */
-function computeChunk(cash, remainingRaw, minChunkRaw) {
+function computeChunk(cash, remainingRaw, minChunkRaw, balanceRaw = null) {
   if (cash <= 0n) return { amount: 0n, belowMin: false };
-  const chunk = cash < remainingRaw ? cash : remainingRaw;
+  let chunk = cash < remainingRaw ? cash : remainingRaw;
+  if (balanceRaw !== null && balanceRaw < chunk) chunk = balanceRaw;
   return { amount: chunk, belowMin: chunk < minChunkRaw };
 }
 
 /**
  * The heart of the bot: one attempt to redeem one chunk. Everything it talks
  * to (contracts, provider, logger, process.exit) is injected so unit tests can
- * drive it through mocked dependencies. `state` exposes the mutable loop state
- * (stopped / txInFlight / remainingRaw) for assertions.
+ * drive it through mocked dependencies.
+ *
+ * State model (the re-sync design):
+ *  - `targetRaw`      : null in full-balance mode, else the fixed target.
+ *  - `processedRaw`   : sum of on-chain confirmed chunks (the "montant traité").
+ *  - `knownBalanceRaw`: best-known redeemable balance — the chunk cap.
+ *  - `remainingRaw`   : DERIVED, never mutated directly —
+ *        fixed target   : targetRaw - processedRaw
+ *        full balance   : knownBalanceRaw (so external deposits increase the
+ *                         goal and manual withdrawals shrink it naturally).
+ *
+ * `remainingRaw` is exposed as a getter on `state` so tests (and the bot's
+ * stop condition) always see the derived value.
  */
 function createChunkRunner({
   mUsdc,
   mUsdcRead,
   provider,
   config,
-  initialRemainingRaw,
+  initialBalanceRaw,
   log = console,
   processExit = process.exit,
+  readBalance, // async () => raw balance; required when cap source is "fresh"
 }) {
   const minChunkRaw = ethers.parseUnits(
     config.minChunkUsdc.toString(),
     config.usdcDecimals,
   );
+  const targetRaw =
+    config.totalTarget !== null
+      ? ethers.parseUnits(config.totalTarget.toString(), config.usdcDecimals)
+      : null;
+
+  // Resolution of the chunk cap source. "monitor" (the default) needs the
+  // periodic balance monitor to exist — if it is disabled there is no "last
+  // monitored value", so we fall back to reading fresh each round.
+  let capSource;
+  if (config.chunkCapSource === "fresh") {
+    capSource = "fresh";
+  } else if (config.balanceMonitorIntervalMs > 0) {
+    capSource = "monitor";
+  } else {
+    log.warn(
+      "  -> CHUNK_CAP_SOURCE=monitor but BALANCE_MONITOR_INTERVAL=0 (no monitor). Falling back to reading the balance fresh each round.",
+    );
+    capSource = "fresh";
+  }
+
   const state = {
     stopped: false,
     txInFlight: false,
-    remainingRaw: initialRemainingRaw,
+    processedRaw: 0n,
+    knownBalanceRaw: initialBalanceRaw,
+    capSource,
+    get remainingRaw() {
+      if (targetRaw === null) {
+        return state.knownBalanceRaw < 0n ? 0n : state.knownBalanceRaw;
+      }
+      const rem = targetRaw - state.processedRaw;
+      return rem < 0n ? 0n : rem;
+    },
+  };
+
+  const done = async () => {
+    log.log(
+      targetRaw === null
+        ? "Redeemable balance fully withdrawn. Done."
+        : "Target fully withdrawn. Done.",
+    );
+    state.stopped = true;
+    provider.removeAllListeners("block");
+    await provider.destroy();
+    processExit(0);
   };
 
   const attemptChunk = async () => {
     // P2: hold the guard IMMEDIATELY, before any `await`. attemptChunk is
-    // async; between this check and the old `txInFlight = true` (after
-    // getCash()) there were awaits, and Base emits a new block every ~2 s —
-    // two block events could both pass the guard and both call
-    // redeemUnderlying() on the same nonce, orphaning one tx forever.
+    // async; between this check and setting txInFlight there must never be an
+    // await — Base emits a new block every ~2 s, so two block events could
+    // both pass the guard and both call redeemUnderlying() on the same nonce.
     if (state.stopped || state.txInFlight) return;
     state.txInFlight = true;
 
     try {
-      // Try the free public RPC first; if it errors (rate limit, flaky
-      // node, etc.) fall back to the Alchemy connection for this check
-      // rather than skipping the round entirely.
+      const ts = new Date().toISOString();
+
+      // 1) Balance usable as the chunk cap: a fresh staticCall, or the value
+      //    the balance monitor last pushed (up to one monitor interval old).
+      let balanceRaw = state.knownBalanceRaw;
+      if (capSource === "fresh") {
+        if (typeof readBalance !== "function") {
+          throw new Error(
+            "chunk cap source 'fresh' requires a readBalance() function",
+          );
+        }
+        try {
+          balanceRaw = await readBalance();
+          state.knownBalanceRaw = balanceRaw;
+        } catch (readErr) {
+          log.warn(
+            `  -> Fresh balance read failed (${readErr.message || readErr}); using known balance ${fmt(state.knownBalanceRaw)}.`,
+          );
+        }
+      }
+
+      // 2) Remaining is derived — stop as soon as it reaches 0, whatever the
+      //    pool's cash says. This also covers a zero balance at startup (full
+      //    mode) instead of looping forever on "Below MIN_CHUNK".
+      if (state.remainingRaw <= 0n) {
+        await done();
+        return;
+      }
+
+      // 3) Liquidity on the market: free public RPC first, Alchemy fallback.
       let cash;
       try {
         cash = await mUsdcRead.getCash();
@@ -264,7 +352,6 @@ function createChunkRunner({
         );
         cash = await mUsdc.getCash();
       }
-      const ts = new Date().toISOString();
 
       if (cash === 0n) {
         log.log(`[${ts}] No liquidity available. Waiting...`);
@@ -275,14 +362,21 @@ function createChunkRunner({
         cash,
         state.remainingRaw,
         minChunkRaw,
+        balanceRaw,
       );
 
       log.log(
-        `[${ts}] Available liquidity: ${fmt(cash)} | Remaining target: ${fmt(
-          state.remainingRaw,
-        )} | Chunk to attempt: ${fmt(chunk)}`,
+        `[${ts}] Liquidity: ${fmt(cash)} | Known balance: ${fmt(
+          balanceRaw,
+        )} | Remaining: ${fmt(state.remainingRaw)} | Chunk to attempt: ${fmt(
+          chunk,
+        )}`,
       );
 
+      if (chunk <= 0n) {
+        log.log("  -> Nothing to withdraw this round.");
+        return;
+      }
       if (belowMin) {
         log.log(
           `  -> Below MIN_CHUNK (${config.minChunkUsdc}), skipping this round.`,
@@ -315,9 +409,9 @@ function createChunkRunner({
 
       // P1: bounded wait. If after `txTimeoutMs` the receipt is still not in,
       // check what really happened on-chain instead of waiting forever. We
-      // never decrement remainingRaw here — if the tx did mine in the end,
-      // the next round's successful receipt handles the decrement (worst case:
-      // a no-op retry on liquidity that has already shrunken).
+      // never touch processedRaw here — if the tx did mine in the end, the
+      // next round's successful receipt handles the accounting (worst case: a
+      // no-op retry on liquidity that has already shrunken).
       const waitRes = await withTimeout(tx.wait(), config.txTimeoutMs);
       let receipt;
       if (waitRes.timedOut) {
@@ -359,20 +453,19 @@ function createChunkRunner({
         log.error(
           `  -> Redeem soft-failed on-chain (Failure event: error=${failureEvent.args.errorCode}, info=${failureEvent.args.info}). No funds were transferred. Will retry next block.`,
         );
-        return; // do NOT decrement remainingRaw — nothing was actually redeemed
+        return; // no accounting — nothing was actually redeemed
       }
 
+      // 4) Only here — confirmed on-chain — do we track progress.
       log.log(`  -> Confirmed in block ${receipt.blockNumber}.`);
-      state.remainingRaw -= chunk;
-      log.log(`  -> Remaining to withdraw: ${fmt(state.remainingRaw)} USDC\n`);
+      state.processedRaw += chunk;
+      state.knownBalanceRaw -= chunk;
+      if (state.knownBalanceRaw < 0n) state.knownBalanceRaw = 0n;
+      log.log(
+        `  -> Processed so far: ${fmt(state.processedRaw)} | Remaining to withdraw: ${fmt(state.remainingRaw)} USDC\n`,
+      );
 
-      if (state.remainingRaw <= 0n) {
-        log.log("Target fully withdrawn. Done.");
-        state.stopped = true;
-        provider.removeAllListeners("block");
-        await provider.destroy();
-        processExit(0);
-      }
+      if (state.remainingRaw <= 0n) await done();
     } catch (err) {
       log.error("Error during chunk attempt:", err.message || err);
       // Keep going — transient RPC errors or reverts shouldn't kill the bot.
@@ -385,13 +478,28 @@ function createChunkRunner({
 }
 
 /**
+ * Returns the `onBalanceRead` callback to hand to createBalanceMonitor so the
+ * monitor's reads feed the runner's knownBalance — but only while no chunk is
+ * in flight. A read landing mid-tx cannot know whether that tx already mined,
+ * so using it would risk double-counting; instead the tx confirmation applies
+ * the exact decrement, and the next idle read resyncs from on-chain truth.
+ */
+function createBalanceWiring(runner) {
+  return (raw) => {
+    if (!runner.state.txInFlight) runner.state.knownBalanceRaw = raw;
+  };
+}
+
+/**
  * Periodically re-reads the redeemable balance (a single cheap staticCall on
  * the free read RPC) and logs it, highlighting changes that did not come from
  * this bot — extra deposits, manual partial withdrawals, interest accrual…
  *
- * It only LOGS; it never alters the withdrawal logic. Disabled when intervalMs
- * <= 0. `setTimer`/`clearTimer` are injectable so tests can drive it without
- * real timers. `read()` is the public read+log step (also run by the timer).
+ * It only LOGS (and, via the optional `onBalanceRead` callback, can feed the
+ * runner's chunk-capping balance); it never submits transactions. Disabled
+ * when intervalMs <= 0. `setTimer`/`clearTimer` are injectable so tests can
+ * drive it without real timers. `read()` is the public read+log step (also
+ * run by the timer).
  */
 function createBalanceMonitor({
   mUsdcRead,
@@ -399,8 +507,10 @@ function createBalanceMonitor({
   intervalMs,
   log = console,
   initialRaw = null,
+  onBalanceRead = () => {},
   setTimer = setInterval,
   clearTimer = clearInterval,
+  lpDecimals = null,
 }) {
   let lastRaw = initialRaw;
   let failures = 0;
@@ -416,20 +526,37 @@ function createBalanceMonitor({
       // .staticCall() forces eth_call — read-only, no signer needed.
       const raw = await mUsdcRead.balanceOfUnderlying.staticCall(walletAddress);
       failures = 0;
+
+      // Best-effort : solde en LP tokens (mToken) affiché sur la même ligne.
+      // Si le caller n'a pas fourni les décimales, elles sont résolues depuis
+      // le contrat ; tout échec de lecture se dégrade en "n/a" sans bloquer.
+      let lpBalance = "";
+      try {
+        let resolvedDecimals = lpDecimals;
+        if (resolvedDecimals === null) {
+          resolvedDecimals = await mUsdcRead.decimals.staticCall();
+        }
+        const lpRaw = await mUsdcRead.balanceOf.staticCall(walletAddress);
+        lpBalance = ` | LP tokens: ${ethers.formatUnits(lpRaw, resolvedDecimals)}`;
+      } catch {
+        lpBalance = " | LP tokens: n/a";
+      }
+
       const ts = new Date().toISOString();
       if (lastRaw !== null && raw !== lastRaw) {
         const delta = raw - lastRaw;
         const sign = delta > 0n ? "+" : "-";
         const abs = delta < 0n ? -delta : delta;
         log.log(
-          `[${ts}] [balance] ${fmt(raw)} USDC (${sign}${fmt(
+          `[${ts}] [balance] ${fmt(raw)} USDC${lpBalance} (${sign}${fmt(
             abs,
           )} USDC depuis la dernière lecture — changement externe)`,
         );
       } else {
-        log.log(`[${ts}] [balance] ${fmt(raw)} USDC (inchangé)`);
+        log.log(`[${ts}] [balance] ${fmt(raw)} USDC${lpBalance} (inchangé)`);
       }
       lastRaw = raw;
+      onBalanceRead(raw);
     } catch (err) {
       failures++;
       const giveUp = failures >= 5;
@@ -490,20 +617,40 @@ async function main() {
   const startingBalanceRaw = await mUsdc.balanceOfUnderlying.staticCall(
     wallet.address,
   );
+
+  // Toujours informatif : solde en LP tokens (mToken) + décimales, affichés
+  // sur la ligne de balance ci-dessous. Best-effort — la logique de retrait ne
+  // dépend que du solde décomposable, donc une lecture LP en échec ne bloque
+  // jamais le démarrage.
+  let lpTokenDecimals = null;
+  let lpBalanceDisplay = "";
+  try {
+    lpTokenDecimals = await mUsdcRead.decimals.staticCall();
+    const lpBalanceRaw = await mUsdcRead.balanceOf.staticCall(wallet.address);
+    lpBalanceDisplay = ` | LP tokens: ${ethers.formatUnits(
+      lpBalanceRaw,
+      lpTokenDecimals,
+    )}`;
+  } catch (lpErr) {
+    console.log(
+      `  (lecture du solde LP tokens impossible: ${lpErr.message || lpErr})`,
+    );
+  }
+
   const zeroBalanceHint =
     startingBalanceRaw === 0n
       ? "  <-- 0 renvoyé: vérifiez MUSDC_ADDRESS (contrat mUSDC) et le réseau du RPC/WSS. Si l'adresse est fausse, le solde paraît nul."
       : "";
   console.log(
-    `Redeemable USDC balance: ${fmt(startingBalanceRaw)}${zeroBalanceHint}`,
+    `Redeemable USDC balance: ${fmt(startingBalanceRaw)}${lpBalanceDisplay}${zeroBalanceHint}`,
   );
 
-  let remainingRaw =
+  const targetRaw =
     config.totalTarget !== null
       ? ethers.parseUnits(config.totalTarget.toString(), USDC_DECIMALS)
-      : startingBalanceRaw;
+      : null;
 
-  if (remainingRaw > startingBalanceRaw) {
+  if (targetRaw !== null && targetRaw > startingBalanceRaw) {
     throw new Error(
       `Requested total (${config.totalTarget}) exceeds your redeemable balance (${fmt(
         startingBalanceRaw,
@@ -511,31 +658,47 @@ async function main() {
     );
   }
 
-  console.log(`Target total withdrawal: ${fmt(remainingRaw)} USDC`);
-  console.log("Will take up to 100% of available liquidity per chunk.");
+  if (targetRaw !== null) {
+    console.log(`Target total withdrawal: ${fmt(targetRaw)} USDC`);
+  } else {
+    console.log(
+      "Mode solde complet — retirera la totalité du solde décomposable. Les",
+    );
+    console.log("dépôts externes (moniteur de balance) seront suivis aussi.");
+  }
+  console.log(
+    "Will take up to 100% of available liquidity per chunk, capped at the known balance.",
+  );
   console.log("Polling market liquidity...\n");
 
-  const { attemptChunk } = createChunkRunner({
+  const runner = createChunkRunner({
     mUsdc,
     mUsdcRead,
     provider,
     config,
-    initialRemainingRaw: remainingRaw,
+    initialBalanceRaw: startingBalanceRaw,
+    readBalance: () =>
+      mUsdcRead.balanceOfUnderlying.staticCall(wallet.address),
   });
+  const { attemptChunk } = runner;
 
   // Balance monitor: re-reads the redeemable balance every
-  // config.balanceMonitorIntervalMs and logs external changes. Read-only — it
-  // never submits anything. Its baseline is the balance read at startup.
+  // config.balanceMonitorIntervalMs, logs external changes and — while idle —
+  // feeds the runner's knownBalance (the chunk cap). While a chunk is in
+  // flight the read is only logged: the confirmation applies the exact
+  // decrement, and the next idle read resyncs from on-chain truth.
   if (config.balanceMonitorIntervalMs > 0) {
     const monitor = createBalanceMonitor({
       mUsdcRead,
       walletAddress: wallet.address,
       intervalMs: config.balanceMonitorIntervalMs,
       initialRaw: startingBalanceRaw,
+      onBalanceRead: createBalanceWiring(runner),
+      lpTokenDecimals,
     });
     monitor.start();
     console.log(
-      `Balance monitor ON — solde décomposable relu toutes les ${config.balanceMonitorIntervalMs / 1000} s (changements externes loggés).\n`,
+      `Balance monitor ON — solde décomposable relu toutes les ${config.balanceMonitorIntervalMs / 1000} s (changements externes loggés et pris en compte par le plafond du chunk).\n`,
     );
   }
 
@@ -569,5 +732,6 @@ module.exports = {
   getTxStatus,
   computeChunk,
   createChunkRunner,
+  createBalanceWiring,
   createBalanceMonitor,
 };

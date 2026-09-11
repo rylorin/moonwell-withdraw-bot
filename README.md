@@ -10,6 +10,8 @@ Bot Node.js pour retirer des USDC du protocole Moonwell (Base) en plusieurs chun
 - **Fallback RPC** : Utilise un RPC public gratuit pour les lectures et bascule vers Alchemy en cas d'erreur
 - **Détection d'échecs** : Capture les `Failure` events des contrats Compound-fork même en cas de succès EVM
 - **Garantie atomicité** : Ne soumet pas de nouvelle transaction tant qu'une précédente est en cours (`txInFlight`)
+- **Re-synchronisation du solde** : Le bot re-lit le solde décomposable périodiquement (moniteur) et en mode solde complet la cible suit le solde courant — un dépôt externe est retiré automatiquement, un retrait manuel réduit la cible
+- **Source de plafond configurable** : `CHUNK_CAP_SOURCE=monitor` (dernière valeur du moniteur, défaut) ou `fresh` (relecture du solde à chaque tour)
 
 ## Prérequis
 
@@ -28,13 +30,15 @@ yarn install
 
 ### Variables d'environnement (recommandé)
 
-| Variable            | Description                     | Défaut                  |
-| ------------------- | ------------------------------- | ----------------------- |
-| `BASE_WSS_URL`      | URL WebSocket Alchemy pour Base | -                       |
-| `PRIVATE_KEY`       | Clé privée du wallet            | -                       |
-| `WITHDRAW_AMOUNT`   | Montant total à retirer (USDC)  | Solde complet           |
-| `MIN_CHUNK`         | Montant minimum par chunk       | 5 USDC                  |
-| `BASE_READ_RPC_URL` | RPC public pour les lectures    | `https://base.drpc.org` |
+| Variable                   | Description                                | Défaut                  |
+| -------------------------- | ------------------------------------------ | ----------------------- |
+| `BASE_WSS_URL`             | URL WebSocket Alchemy pour Base            | -                       |
+| `PRIVATE_KEY`              | Clé privée du wallet                       | -                       |
+| `WITHDRAW_AMOUNT`          | Montant total à retirer (USDC)             | Solde complet           |
+| `MIN_CHUNK`                | Montant minimum par chunk                  | 5 USDC                  |
+| `BASE_READ_RPC_URL`        | RPC public pour les lectures               | `https://base.drpc.org` |
+| `BALANCE_MONITOR_INTERVAL` | Relecture du solde décomposable (secondes) | `60` (`0` = désactivé)  |
+| `CHUNK_CAP_SOURCE`         | Source du plafond de chunk                 | `monitor` (ou `fresh`)  |
 
 ### Exemple d'exécution
 
@@ -62,10 +66,11 @@ Les paliers de gaz sont configurés dans le fichier :
 1. Le bot se connecte au réseau Base via WebSocket
 2. Il lit le solde USDC décomposable du wallet
 3. À chaque bloc, il vérifie la liquidité disponible dans le pool mUSDC
-4. Il soumet une transaction `redeemUnderlying` pour la plus petite valeur entre :
-   - La liquidité totale disponible
+4. Il soumet une transaction `redeemUnderlying`, plafonnée à la plus petite valeur entre :
+   - La liquidité totale disponible (`getCash()`)
    - Le montant restant à retirer
-5. Il répète jusqu'à ce que le montant cible soit atteint
+   - Le solde décomposable connu (dernière valeur du moniteur, ou relecture à chaque tour selon `CHUNK_CAP_SOURCE`)
+5. Il répète à chaque bloc jusqu'à ce que la cible soit atteinte : sans `WITHDRAW_AMOUNT`, la cible suit le solde courant (les dépôts externes sont retirés automatiquement, un retrait manuel réduit la cible)
 
 ## Sécurité
 
