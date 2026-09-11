@@ -1,0 +1,32 @@
+services:
+  
+  bot-latest:
+    image: moonwell-withdraw-bot:0.0.3
+    environment:
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - BASE_WSS_URL=${BASE_WSS_URL}
+      - MUSDC_ADDRESS=${MUSDC_ADDRESS}
+#    command: ["node", "moonwell-withdraw-bot-chunked.js"]
+    networks:
+      - dmz_network
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    
+  bot:
+    image: moonwell-withdraw-bot:0.0.2
+    environment:
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - BASE_WSS_URL=${BASE_WSS_URL}
+      - MUSDC_ADDRESS=${MUSDC_ADDRESS}
+#    command: ["node", "moonwell-withdraw-bot-chunked.js"]
+    networks:
+      - dmz_network
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+
+networks:
+  dmz_network:
+    driver: overlay
+    attachable: true

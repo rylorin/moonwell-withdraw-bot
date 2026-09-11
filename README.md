@@ -28,13 +28,13 @@ yarn install
 
 ### Variables d'environnement (recommandé)
 
-| Variable | Description | Défaut |
-|----------|-------------|--------|
-| `BASE_WSS_URL` | URL WebSocket Alchemy pour Base | - |
-| `PRIVATE_KEY` | Clé privée du wallet | - |
-| `WITHDRAW_AMOUNT` | Montant total à retirer (USDC) | Solde complet |
-| `MIN_CHUNK_USDC` | Montant minimum par chunk | 5 USDC |
-| `BASE_READ_RPC_URL` | RPC public pour les lectures | `https://base.drpc.org` |
+| Variable            | Description                     | Défaut                  |
+| ------------------- | ------------------------------- | ----------------------- |
+| `BASE_WSS_URL`      | URL WebSocket Alchemy pour Base | -                       |
+| `PRIVATE_KEY`       | Clé privée du wallet            | -                       |
+| `WITHDRAW_AMOUNT`   | Montant total à retirer (USDC)  | Solde complet           |
+| `MIN_CHUNK`         | Montant minimum par chunk       | 5 USDC                  |
+| `BASE_READ_RPC_URL` | RPC public pour les lectures    | `https://base.drpc.org` |
 
 ### Exemple d'exécution
 
@@ -51,11 +51,11 @@ yarn start
 
 Les paliers de gaz sont configurés dans le fichier :
 
-| Palier | Priorité (gwei) | Max Fee (gwei) | Condition |
-|--------|-----------------|----------------|-----------|
-| 1 | 0.3 | 0.6 | Chunk >= $100 |
-| 2 | 0.1 | 0.3 | Chunk >= $30 |
-| 3 | 0.02 | 0.1 | Chunk < $30 |
+| Palier | Priorité (gwei) | Max Fee (gwei) | Condition     |
+| ------ | --------------- | -------------- | ------------- |
+| 1      | 0.3             | 0.6            | Chunk >= $100 |
+| 2      | 0.1             | 0.3            | Chunk >= $30  |
+| 3      | 0.02            | 0.1            | Chunk < $30   |
 
 ## Fonctionnement
 

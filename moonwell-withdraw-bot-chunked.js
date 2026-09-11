@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 /**
  * Moonwell (Base) USDC withdrawal bot — CHUNKED VERSION
  * -------------------------------------------------------
@@ -14,53 +16,72 @@
  * - Only run this against a wallet you control, on a machine you trust.
  * - Contract address verified on BaseScan:
  *   https://basescan.org/address/0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22
+ *
+ * The module exports its pure logic (loadConfig, getGasForChunk, withTimeout,
+ * createChunkRunner, ...) so it can be unit-tested; when executed directly it
+ * runs the bot (see `if (require.main === module)` at the end).
  */
 
 const { ethers } = require("ethers");
 require("dotenv").config();
 
 // ---------- CONFIG ----------
-// Use a wss:// URL here (e.g. wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY).
-// >>> PASTE YOUR NEW ALCHEMY WSS URL BELOW (replace the placeholder) <<<
-const WSS_URL = process.env.BASE_WSS_URL || "PASTE_YOUR_WSS_URL_HERE";
-
-// Free public RPC used only for the high-frequency getCash() read calls,
-// to keep that volume off the paid Alchemy connection. No signup needed.
-const READ_RPC_URL = process.env.BASE_READ_RPC_URL || "https://base.drpc.org";
-
-// >>> PASTE YOUR NEW PRIVATE KEY BELOW (replace the placeholder) <<<
-const PRIVATE_KEY = process.env.PRIVATE_KEY || "PASTE_YOUR_PRIVATE_KEY_HERE";
-const MUSDC_ADDRESS = "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22"; // Moonwell mUSDC on Base
 const USDC_DECIMALS = 6;
 
-// Total amount you want withdrawn in the end (human units, e.g. 70000)
-const TOTAL_TARGET = process.env.WITHDRAW_AMOUNT
-  ? parseFloat(process.env.WITHDRAW_AMOUNT)
-  : null; // if null, withdraws your FULL redeemable balance
-
-// Don't bother submitting a tx for tiny dust amounts of liquidity.
-const MIN_CHUNK_USDC = process.env.MIN_CHUNK_USDC
-  ? parseFloat(process.env.MIN_CHUNK_USDC)
-  : 5;
-
-// Gas settings, tiered by the USDC amount of the chunk being attempted.
-// Larger chunks are worth paying more to win inclusion; small/dust chunks
-// aren't worth overpaying gas for. Add more tiers if you want finer control.
-const GAS_TIERS = [
+// Fee tiers, ordered largest amount first. `GAS_TIERS.find` scans from the
+// top, so a chunk amount >= threshold picks that tier.
+const DEFAULT_GAS_TIERS = [
   // { minUsdc: <threshold>, priorityGwei: <tip>, maxFeeGwei: <ceiling> }
   { minUsdc: 100, priorityGwei: "0.3", maxFeeGwei: "0.6" }, // $100+ chunks
   { minUsdc: 30, priorityGwei: "0.1", maxFeeGwei: "0.3" }, // $30+ chunks
   { minUsdc: 0, priorityGwei: "0.02", maxFeeGwei: "0.1" }, // below $30
 ];
+const DEFAULT_MUSDC_ADDRESS = "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22";
+const DEFAULT_READ_RPC_URL = "https://base.drpc.org";
+// Use a wss:// URL here (e.g. wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY).
+const DEFAULT_WSS_PLACEHOLDER = "PASTE_YOUR_WSS_URL_HERE";
+const DEFAULT_PRIVATE_KEY_PLACEHOLDER = "PASTE_YOUR_PRIVATE_KEY_HERE";
 
-function getGasForChunk(chunkUsdcFloat) {
-  const tier =
-    GAS_TIERS.find((t) => chunkUsdcFloat >= t.minUsdc) ??
-    GAS_TIERS[GAS_TIERS.length - 1];
+/**
+ * Build the config object from an `env` map (defaults to process.env).
+ * Pure — no network, no side effects → unit-testable.
+ */
+function loadConfig(env = process.env) {
   return {
-    maxPriorityFeePerGas: ethers.parseUnits(tier.priorityGwei, "gwei"),
-    maxFeePerGas: ethers.parseUnits(tier.maxFeeGwei, "gwei"),
+    wssUrl: env.BASE_WSS_URL || DEFAULT_WSS_PLACEHOLDER,
+    readRpcUrl: env.BASE_READ_RPC_URL || DEFAULT_READ_RPC_URL,
+    privateKey: env.PRIVATE_KEY || DEFAULT_PRIVATE_KEY_PLACEHOLDER,
+    mUsdcAddress: env.MUSDC_ADDRESS || DEFAULT_MUSDC_ADDRESS,
+    // Human units (e.g. 70000); null → withdraw the full redeemable balance.
+    totalTarget: env.WITHDRAW_AMOUNT ? parseFloat(env.WITHDRAW_AMOUNT) : null,
+    minChunkUsdc: env.MIN_CHUNK ? parseFloat(env.MIN_CHUNK) : 5,
+    usdcDecimals: USDC_DECIMALS,
+    gasTiers: DEFAULT_GAS_TIERS,
+    // P1: cap on how long we wait for a transaction to be mined before giving
+    // up this round (see `withTimeout`).
+    txTimeoutMs: Number(env.TX_TIMEOUT_MS) || 60_000,
   };
+}
+
+/**
+ * Return the list of required settings still set to their placeholder value.
+ */
+function checkPlaceholders(config) {
+  const errors = [];
+  if (
+    !config.privateKey ||
+    config.privateKey === DEFAULT_PRIVATE_KEY_PLACEHOLDER
+  ) {
+    errors.push("PRIVATE_KEY");
+  }
+  if (!config.wssUrl || config.wssUrl === DEFAULT_WSS_PLACEHOLDER) {
+    errors.push("BASE_WSS_URL");
+  }
+  return errors;
+}
+
+function fmt(raw) {
+  return ethers.formatUnits(raw, USDC_DECIMALS);
 }
 
 // ---------- ABI (minimal Compound-style mToken interface) ----------
@@ -71,63 +92,150 @@ const MTOKEN_ABI = [
   "event Failure(uint256 errorCode, uint256 info, uint256 detail)",
 ];
 
-function fmt(raw) {
-  return ethers.formatUnits(raw, USDC_DECIMALS);
+// ---------- Startup diagnostics ----------
+
+/**
+ * Hide the API key of a wss://http(s):// URL so we can log the endpoint
+ * without leaking the secret. Only the last path segment is masked.
+ */
+function maskUrl(url) {
+  try {
+    const u = new URL(url);
+    u.search = "";
+    u.hash = "";
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length > 0) parts[parts.length - 1] = "***";
+    u.pathname = "/" + parts.join("/");
+    return u.toString();
+  } catch {
+    return "(URL invalide)";
+  }
 }
 
-async function main() {
-  if (!PRIVATE_KEY || PRIVATE_KEY === "PASTE_YOUR_PRIVATE_KEY_HERE") {
-    throw new Error(
-      "Edit the PRIVATE_KEY placeholder near the top of this file with your new key."
-    );
-  }
-  if (!WSS_URL || WSS_URL === "PASTE_YOUR_WSS_URL_HERE") {
-    throw new Error(
-      "Edit the WSS_URL placeholder near the top of this file with your new Alchemy wss:// URL."
-    );
-  }
+/**
+ * Print every parameter that influences behaviour at startup. The mUSDC
+ * address is shown prominently because a wrong value makes balance reads
+ * return 0 / revert — exactly the "solde introuvable" symptom in production.
+ */
+function logStartupParameters(config, { walletAddress }, log = console) {
+  const targetDesc =
+    config.totalTarget !== null
+      ? `${config.totalTarget} USDC`
+      : "solde décomposable complet";
+  const tierDesc = config.gasTiers
+    .map(
+      (t) =>
+        `$${t.minUsdc}+ → prio ${t.priorityGwei} / max ${t.maxFeeGwei} gwei`,
+    )
+    .join(" | ");
 
-  const provider = new ethers.WebSocketProvider(WSS_URL);
-  const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-  const mUsdc = new ethers.Contract(MUSDC_ADDRESS, MTOKEN_ABI, wallet);
-
-  // Separate read-only provider for the high-frequency getCash() checks —
-  // keeps that load off the paid Alchemy connection. Block subscription and
-  // transaction submission still go through the Alchemy WSS provider above.
-  const readProvider = new ethers.JsonRpcProvider(READ_RPC_URL);
-  const mUsdcRead = new ethers.Contract(MUSDC_ADDRESS, MTOKEN_ABI, readProvider);
-
-  console.log(`Wallet: ${wallet.address}`);
-
-  const startingBalanceRaw = await mUsdc.balanceOfUnderlying.staticCall(
-    wallet.address
+  log.log("==================================================");
+  log.log("Moonwell withdrawal bot — configuration");
+  log.log("--------------------------------------------------");
+  log.log(`  mUSDC contract  : ${config.mUsdcAddress}`);
+  log.log(
+    `    (vérifie sur https://basescan.org/address/${config.mUsdcAddress})`,
   );
-  console.log(`Redeemable USDC balance: ${fmt(startingBalanceRaw)}`);
+  log.log(`  Wallet          : ${walletAddress}`);
+  log.log(`  WSS endpoint    : ${maskUrl(config.wssUrl)}`);
+  log.log(`  Read RPC        : ${config.readRpcUrl}`);
+  log.log(`  USDC decimals   : ${config.usdcDecimals}`);
+  log.log(`  WITHDRAW_AMOUNT : ${targetDesc}`);
+  log.log(`  MIN_CHUNK       : ${config.minChunkUsdc}`);
+  log.log(`  TX timeout      : ${config.txTimeoutMs / 1000} s`);
+  log.log(`  Gas tiers       : ${tierDesc}`);
+  log.log("==================================================\n");
+}
 
-  let remainingRaw =
-    TOTAL_TARGET !== null
-      ? ethers.parseUnits(TOTAL_TARGET.toString(), USDC_DECIMALS)
-      : startingBalanceRaw;
+// ---------- Pure helpers ----------
 
-  if (remainingRaw > startingBalanceRaw) {
-    throw new Error(
-      `Requested total (${TOTAL_TARGET}) exceeds your redeemable balance (${fmt(
-        startingBalanceRaw
-      )}).`
-    );
+function getGasForChunk(chunkUsdcFloat, tiers = DEFAULT_GAS_TIERS) {
+  const tier =
+    tiers.find((t) => chunkUsdcFloat >= t.minUsdc) ?? tiers[tiers.length - 1];
+  return {
+    maxPriorityFeePerGas: ethers.parseUnits(tier.priorityGwei, "gwei"),
+    maxFeePerGas: ethers.parseUnits(tier.maxFeeGwei, "gwei"),
+  };
+}
+
+/**
+ * P1: cap `tx.wait()` so a tx stuck pending (base fee > our max fee ceiling)
+ * can never stall the whole bot (txInFlight stays true otherwise → every later
+ * block is ignored). Resolves `{ timedOut: true }` after `ms` if the wrapped
+ * promise has still not settled; otherwise `{ timedOut: false, value }`.
+ * Rejections are propagated unchanged.
+ */
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), ms);
+  });
+  return Promise.race([
+    promise.then((value) => ({ timedOut: false, value })),
+    timeout,
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * P1: ask the provider for the real on-chain status of a tx after our wait
+ * timed out. Returns "pending" (still in mempool), "mined" (a block was won
+ * just after our deadline), "dropped" (gone from the mempool — replaced or
+ * evicted) or "unknown" (provider error, we simply don't know).
+ */
+async function getTxStatus(provider, hash) {
+  try {
+    const data = await provider.getTransaction(hash);
+    if (!data) return "dropped";
+    if (data.blockNumber) return "mined";
+    return "pending";
+  } catch {
+    return "unknown";
   }
+}
 
-  console.log(`Target total withdrawal: ${fmt(remainingRaw)} USDC`);
-  console.log("Will take up to 100% of available liquidity per chunk.");
-  console.log("Polling market liquidity...\n");
+/**
+ * The chunk = min(available cash, remaining target). Returns `{ amount,
+ * belowMin }` as raw BigInts. Pure → unit-testable.
+ */
+function computeChunk(cash, remainingRaw, minChunkRaw) {
+  if (cash <= 0n) return { amount: 0n, belowMin: false };
+  const chunk = cash < remainingRaw ? cash : remainingRaw;
+  return { amount: chunk, belowMin: chunk < minChunkRaw };
+}
 
-  const minChunkRaw = ethers.parseUnits(MIN_CHUNK_USDC.toString(), USDC_DECIMALS);
-
-  let stopped = false;
-  let txInFlight = false; // guard: never submit a new chunk while one is pending
+/**
+ * The heart of the bot: one attempt to redeem one chunk. Everything it talks
+ * to (contracts, provider, logger, process.exit) is injected so unit tests can
+ * drive it through mocked dependencies. `state` exposes the mutable loop state
+ * (stopped / txInFlight / remainingRaw) for assertions.
+ */
+function createChunkRunner({
+  mUsdc,
+  mUsdcRead,
+  provider,
+  config,
+  initialRemainingRaw,
+  log = console,
+  processExit = process.exit,
+}) {
+  const minChunkRaw = ethers.parseUnits(
+    config.minChunkUsdc.toString(),
+    config.usdcDecimals,
+  );
+  const state = {
+    stopped: false,
+    txInFlight: false,
+    remainingRaw: initialRemainingRaw,
+  };
 
   const attemptChunk = async () => {
-    if (stopped || txInFlight) return;
+    // P2: hold the guard IMMEDIATELY, before any `await`. attemptChunk is
+    // async; between this check and the old `txInFlight = true` (after
+    // getCash()) there were awaits, and Base emits a new block every ~2 s —
+    // two block events could both pass the guard and both call
+    // redeemUnderlying() on the same nonce, orphaning one tx forever.
+    if (state.stopped || state.txInFlight) return;
+    state.txInFlight = true;
 
     try {
       // Try the free public RPC first; if it errors (rate limit, flaky
@@ -137,58 +245,84 @@ async function main() {
       try {
         cash = await mUsdcRead.getCash();
       } catch (readErr) {
-        console.warn(
-          `  -> Public RPC getCash() failed (${readErr.message || readErr}), falling back to Alchemy for this check.`
+        log.warn(
+          `  -> Public RPC getCash() failed (${readErr.message || readErr}), falling back to Alchemy for this check.`,
         );
         cash = await mUsdc.getCash();
       }
       const ts = new Date().toISOString();
 
       if (cash === 0n) {
-        console.log(`[${ts}] No liquidity available. Waiting...`);
+        log.log(`[${ts}] No liquidity available. Waiting...`);
         return;
       }
 
-      // Take the smaller of: (all available cash) or (what's left to withdraw)
-      let chunk = cash < remainingRaw ? cash : remainingRaw;
-
-      console.log(
-        `[${ts}] Available liquidity: ${fmt(cash)} | Remaining target: ${fmt(
-          remainingRaw
-        )} | Chunk to attempt: ${fmt(chunk)}`
+      const { amount: chunk, belowMin } = computeChunk(
+        cash,
+        state.remainingRaw,
+        minChunkRaw,
       );
 
-      if (chunk < minChunkRaw) {
-        console.log(
-          `  -> Below MIN_CHUNK_USDC (${MIN_CHUNK_USDC}), skipping this round.`
+      log.log(
+        `[${ts}] Available liquidity: ${fmt(cash)} | Remaining target: ${fmt(
+          state.remainingRaw,
+        )} | Chunk to attempt: ${fmt(chunk)}`,
+      );
+
+      if (belowMin) {
+        log.log(
+          `  -> Below MIN_CHUNK (${config.minChunkUsdc}), skipping this round.`,
         );
         return;
       }
 
-      console.log("  -> Submitting redeemUnderlying tx...");
-      txInFlight = true;
+      log.log("  -> Submitting redeemUnderlying tx...");
 
       // Pick gas fee tier based on the size of this specific chunk.
       const chunkUsdcFloat = parseFloat(fmt(chunk));
       const { maxPriorityFeePerGas, maxFeePerGas } = getGasForChunk(
-        chunkUsdcFloat
+        chunkUsdcFloat,
+        config.gasTiers,
       );
-      console.log(
-        `  -> Gas tier for $${chunkUsdcFloat.toFixed(2)} chunk: priority=${ethers.formatUnits(
+      log.log(
+        `  -> Gas tier for $${chunkUsdcFloat.toFixed(
+          2,
+        )} chunk: priority=${ethers.formatUnits(
           maxPriorityFeePerGas,
-          "gwei"
-        )} gwei, max=${ethers.formatUnits(maxFeePerGas, "gwei")} gwei`
+          "gwei",
+        )} gwei, max=${ethers.formatUnits(maxFeePerGas, "gwei")} gwei`,
       );
 
       const tx = await mUsdc.redeemUnderlying(chunk, {
         maxPriorityFeePerGas,
         maxFeePerGas,
       });
-      console.log(`  -> Submitted: ${tx.hash}`);
-      const receipt = await tx.wait();
+      log.log(`  -> Submitted: ${tx.hash}`);
+
+      // P1: bounded wait. If after `txTimeoutMs` the receipt is still not in,
+      // check what really happened on-chain instead of waiting forever. We
+      // never decrement remainingRaw here — if the tx did mine in the end,
+      // the next round's successful receipt handles the decrement (worst case:
+      // a no-op retry on liquidity that has already shrunken).
+      const waitRes = await withTimeout(tx.wait(), config.txTimeoutMs);
+      let receipt;
+      if (waitRes.timedOut) {
+        const status = await getTxStatus(provider, tx.hash);
+        if (status === "mined") {
+          // It mined just past our deadline — process the receipt normally.
+          receipt = await provider.getTransactionReceipt(tx.hash);
+        } else {
+          log.warn(
+            `  -> Tx ${tx.hash} still ${status} after ${config.txTimeoutMs / 1000}s — not mined. Giving up this round; nothing was decremented. Will retry next block.`,
+          );
+          return;
+        }
+      } else {
+        receipt = waitRes.value;
+      }
 
       if (receipt.status !== 1) {
-        console.error("  -> Transaction FAILED/reverted. Will retry next block.");
+        log.error("  -> Transaction FAILED/reverted. Will retry next block.");
         return;
       }
 
@@ -198,9 +332,9 @@ async function main() {
       // instead of a revert. Check for it explicitly; receipt.status alone
       // is not sufficient here.
       const failureEvent = receipt.logs
-        .map((log) => {
+        .map((entry) => {
           try {
-            return mUsdc.interface.parseLog(log);
+            return mUsdc.interface.parseLog(entry);
           } catch {
             return null;
           }
@@ -208,37 +342,131 @@ async function main() {
         .find((parsed) => parsed && parsed.name === "Failure");
 
       if (failureEvent) {
-        console.error(
-          `  -> Redeem soft-failed on-chain (Failure event: error=${failureEvent.args.errorCode}, info=${failureEvent.args.info}). No funds were transferred. Will retry next block.`
+        log.error(
+          `  -> Redeem soft-failed on-chain (Failure event: error=${failureEvent.args.errorCode}, info=${failureEvent.args.info}). No funds were transferred. Will retry next block.`,
         );
         return; // do NOT decrement remainingRaw — nothing was actually redeemed
       }
 
-      console.log(`  -> Confirmed in block ${receipt.blockNumber}.`);
-      remainingRaw -= chunk;
-      console.log(`  -> Remaining to withdraw: ${fmt(remainingRaw)} USDC\n`);
+      log.log(`  -> Confirmed in block ${receipt.blockNumber}.`);
+      state.remainingRaw -= chunk;
+      log.log(`  -> Remaining to withdraw: ${fmt(state.remainingRaw)} USDC\n`);
 
-      if (remainingRaw <= 0n) {
-        console.log("Target fully withdrawn. Done.");
-        stopped = true;
+      if (state.remainingRaw <= 0n) {
+        log.log("Target fully withdrawn. Done.");
+        state.stopped = true;
         provider.removeAllListeners("block");
         await provider.destroy();
-        process.exit(0);
+        processExit(0);
       }
     } catch (err) {
-      console.error("Error during chunk attempt:", err.message || err);
+      log.error("Error during chunk attempt:", err.message || err);
       // Keep going — transient RPC errors or reverts shouldn't kill the bot.
     } finally {
-      txInFlight = false;
+      state.txInFlight = false;
     }
   };
 
-  console.log("Subscribing to new blocks — will check liquidity on each one.\n");
+  return { attemptChunk, state };
+}
+
+// ---------- Entry point ----------
+
+async function main() {
+  const config = loadConfig(process.env);
+
+  const missing = checkPlaceholders(config);
+  if (missing.length > 0) {
+    throw new Error(
+      `Config manquante: ${missing.join(
+        ", ",
+      )}. Définissez-les dans votre environnement ou le fichier .env.`,
+    );
+  }
+
+  const provider = new ethers.WebSocketProvider(config.wssUrl);
+  const wallet = new ethers.Wallet(config.privateKey, provider);
+  const mUsdc = new ethers.Contract(config.mUsdcAddress, MTOKEN_ABI, wallet);
+
+  // Separate read-only provider for the high-frequency getCash() checks —
+  // keeps that load off the paid Alchemy connection. Block subscription and
+  // transaction submission still go through the Alchemy WSS provider above.
+  const readProvider = new ethers.JsonRpcProvider(config.readRpcUrl);
+  const mUsdcRead = new ethers.Contract(
+    config.mUsdcAddress,
+    MTOKEN_ABI,
+    readProvider,
+  );
+
+  // Startup diagnostics: print every parameter that drives the bot. In
+  // production, a "balance not found" is almost always a wrong MUSDC_ADDRESS
+  // (or the wrong network RPC) — these lines make it visible immediately.
+  logStartupParameters(config, { walletAddress: wallet.address });
+
+  const startingBalanceRaw = await mUsdc.balanceOfUnderlying.staticCall(
+    wallet.address,
+  );
+  const zeroBalanceHint =
+    startingBalanceRaw === 0n
+      ? "  <-- 0 renvoyé: vérifiez MUSDC_ADDRESS (contrat mUSDC) et le réseau du RPC/WSS. Si l'adresse est fausse, le solde paraît nul."
+      : "";
+  console.log(
+    `Redeemable USDC balance: ${fmt(startingBalanceRaw)}${zeroBalanceHint}`,
+  );
+
+  let remainingRaw =
+    config.totalTarget !== null
+      ? ethers.parseUnits(config.totalTarget.toString(), USDC_DECIMALS)
+      : startingBalanceRaw;
+
+  if (remainingRaw > startingBalanceRaw) {
+    throw new Error(
+      `Requested total (${config.totalTarget}) exceeds your redeemable balance (${fmt(
+        startingBalanceRaw,
+      )}).`,
+    );
+  }
+
+  console.log(`Target total withdrawal: ${fmt(remainingRaw)} USDC`);
+  console.log("Will take up to 100% of available liquidity per chunk.");
+  console.log("Polling market liquidity...\n");
+
+  const { attemptChunk } = createChunkRunner({
+    mUsdc,
+    mUsdcRead,
+    provider,
+    config,
+    initialRemainingRaw: remainingRaw,
+  });
+
+  console.log(
+    "Subscribing to new blocks — will check liquidity on each one.\n",
+  );
   provider.on("block", attemptChunk);
   attemptChunk(); // run immediately on start, don't wait for the first block
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  DEFAULT_GAS_TIERS,
+  DEFAULT_MUSDC_ADDRESS,
+  DEFAULT_READ_RPC_URL,
+  MTOKEN_ABI,
+  USDC_DECIMALS,
+  loadConfig,
+  checkPlaceholders,
+  maskUrl,
+  logStartupParameters,
+  fmt,
+  getGasForChunk,
+  withTimeout,
+  getTxStatus,
+  computeChunk,
+  createChunkRunner,
+};

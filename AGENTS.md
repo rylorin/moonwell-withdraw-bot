@@ -8,7 +8,8 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 
 ## Structure du projet
 
-- **`moonwell-withdraw-bot-chunked.js`** — Le bot complet (fichier unique, ~244 lignes)
+- **`moonwell-withdraw-bot-chunked.js`** — Le bot complet (fichier unique)
+- **`tests/bot.test.js`** — Tests unitaires (`node --test`), 31 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
 - **`README.md`** — Documentation utilisateur
 
 ## Stack technique
@@ -21,9 +22,11 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 ## Architecture du code
 
 ### Configuration (haut de fichier)
-Toutes les constantes sont au début : `WSS_URL`, `PRIVATE_KEY`, `MUSDC_ADDRESS`, `USDC_DECIMALS`, `TOTAL_TARGET`, `MIN_CHUNK_USDC`, `GAS_TIERS`. Les secrets se lisent via `process.env` avec des placeholders en fallback.
+
+Toutes les constantes sont au début : `WSS_URL`, `PRIVATE_KEY`, `MUSDC_ADDRESS`, `USDC_DECIMALS`, `TOTAL_TARGET`, `MIN_CHUNK`, `GAS_TIERS`. Les secrets se lisent via `process.env` avec des placeholders en fallback.
 
 ### Logique principale (fonction `main`)
+
 1. **Validation** — Vérifie que les placeholders secrets ont été remplacés et que le montant cible ne dépasse pas le solde
 2. **Initialisation** — Crée wallet, contrats (signé + lecture)
 3. **`attemptChunk()`** — La boucle de retrait, déclenchée à chaque nouveau bloc
@@ -58,8 +61,25 @@ Toutes les constantes sont au début : `WSS_URL`, `PRIVATE_KEY`, `MUSDC_ADDRESS`
 
 ## Tests / exécution
 
-Pas de suite de tests. Pour exécuter :
+Suite de tests unitaires via le runner natif Node (`node:test`) — aucun réseau, aucune transaction réelle, providers et contrats mockés :
+
+```bash
+node --test        # ou: yarn test
+node --check moonwell-withdraw-bot-chunked.js   # vérification syntaxe
+```
+
+Les fonctions pures (`loadConfig`, `getGasForChunk`, `withTimeout`, `getTxStatus`, `computeChunk`) et le runner (`createChunkRunner`, avec état `state.{stopped,txInFlight,remainingRaw}`) sont exportés par le fichier précisément pour être testables. Les tests couvrent notamment les deux correctifs : **P1** (tx jamais minée → timeout → reprise de boucle sans blocage) et **P2** (deux `attemptChunk()` concurrents → une seule soumission).
+
+Pour exécuter le bot :
+
 ```bash
 BASE_WSS_URL="wss://..." PRIVATE_KEY="..." node moonwell-withdraw-bot-chunked.js
 ```
+
 Attention : le script soumet de vraies transactions on-chain. Ne l'exécuter que dans un contexte de test contrôlé ou en production délibérée.
+
+### Correctifs appliqués (09/09/2026)
+
+- **P1** — `tx.wait()` encadré par `withTimeout()` (`TX_TIMEOUT_MS`, défaut 60 s). Au timeout, `getTxStatus()` donne le statut réel : `pending`/`dropped` → warning + reprise au bloc suivant sans décrémenter ; `mined` → receipt traité normalement.
+- **P2** — `txInFlight = true` posé immédiatement après le garde, avant tout `await`, pour éviter la double soumission au même nonce.
+- **Diagnostics au démarrage** — `logStartupParameters()` affiche mUSDC_ADDRESS (avec lien BaseScan), wallet, WSS masqué, RPC, paliers de gaz, etc. Un solde nul déclenche un indice explicite (« vérifiez MUSDC_ADDRESS »).
