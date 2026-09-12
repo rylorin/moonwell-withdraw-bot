@@ -67,7 +67,6 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 **Amélioration backoff (12/09/2026)** : une reconnexion échouée ne fait plus **quitter** le processus — elle est relancée en *backoff* exponentiel (`WS_BACKOFF_BASE_MS` = 5 s, ×2 par échec, plafonné à `WS_BACKOFF_MAX_MS` = 60 s). Le budget par défaut monte à **10** (`WS_MAX_RECONNECTS`) ; avec l'espacement du backoff, ~8 min de réseau absent peuvent être absorbées — de quoi survivre à un réveil de veille Mac dont la DNS est transitoirement morte (crash `getaddrinfo ENOTFOUND` sur le socket ws, à l'origine du correctif). Avant d'adopter un socket frais, une sonde de santé (`getBlockNumber` via `withTimeout`, 5 s) vérifie qu'il répond réellement.
 
-
 **Critère de validation** : couper la connexion réseau en cours d'exécution → log explicite et soit reconnexion, soit arrêt propre. ✅ couvert par les tests `watchdog:*` (stall → reconnexion budgetée, `WS_ON_STALL=exit`, fermeture du socket, reconnexion différée, rebind `setProvider`, budget épuisé → `process.exit(1)`) et `runner: setConnection …`.
 
 ---
