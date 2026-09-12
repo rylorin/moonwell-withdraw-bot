@@ -1,6 +1,6 @@
 # PLAN — Correctifs & améliorations du bot Moonwell
 
-Statut : **P1, P2 & P3 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 66 tests). P4–P6 toujours ouverts.
+Statut : **P1, P2, P3, P4 & P6 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 71 tests). P5 toujours ouvert.
 Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ## Barème de priorité
@@ -71,7 +71,7 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ---
 
-## 🟣 P4 — Boucle infinie sur les poussières (< MIN_CHUNK)
+## ✅ 🟣 P4 — Boucle infinie sur les poussières (< MIN_CHUNK) (TRAITÉ)
 
 **Localisation** : [ligne 161-165](../moonwell-withdraw-bot-chunked.js#L161)
 
@@ -83,7 +83,9 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 2. Afficher un message final (« Solde résiduel de X USDC en dessous du minimum — retrait terminé ») et arrêt propre (`stopped = true` → destroy provider → `process.exit(0)`)
 3. À valider : faut-il laisser la poussière ou la retirer en ignorant le minimum sur le dernier chunk ?
 
-**Critère de validation** : configurer un reliquat < MIN → le bot s'arrête seul avec un message explicite.
+**Correctif appliqué (12/09/2026)** : dans `attemptChunk`, dès que `remainingRaw` reste > 0 mais < `minChunkRaw` (poussière), le bot log un message explicite puis s'arrête proprement via `done()` (`stopped = true` → destroy provider → `process.exit(0)`) — plus de boucle « Below MIN_CHUNK » à chaque bloc.
+
+**Critère de validation** : configurer un reliquat < MIN → le bot s'arrête seul avec un message explicite. ✅ couvert par les tests `P4: remaining dust below MIN_CHUNK stops cleanly`.
 
 ---
 
@@ -102,13 +104,15 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ---
 
-## 🟣 P6 — Nettoyage des providers en fin de vie
+## ✅ 🟣 P6 — Nettoyage des providers en fin de vie (TRAITÉ)
 
 **Localisation** : [readProvider ligne 97](../moonwell-withdraw-bot-chunked.js#L97)
 
 **Problème** : `readProvider` n'est jamais détruit et aucun handler `error` n'y est attaché. Sans impact aujourd'hui (le `process.exit(0)` [ligne 226](../moonwell-withdraw-bot-chunked.js#L226) s'en charge), mais voué à fuiter si le processus est refactorisé (ex. boucle externe).
 
 **Correctif proposé** : sur le chemin d'arrêt, détruire `readProvider` en plus du WSS provider.
+
+**Correctif appliqué (12/09/2026)** : nouveau `createShutdownHandler()` exporté — stop des jobs de fond (moniteur de balance, watchdog) puis destruction des deux providers (WSS + RPC de lecture) sur SIGINT/SIGTERM, idempotent (un second signal est ignoré), `process.exit(0)` sur succès / `process.exit(1)` sur erreur. Un handler `error` est aussi attaché au `readProvider`.
 
 ---
 
@@ -125,7 +129,7 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 1. **P2** (minimal, 2 lignes) → réduit aussi la probabilité du P1
 2. **P1** (timeout + reprise de boucle) — la correction la plus importante pour la fiabilité
-3. **P4** (arrêt propre) + **P6** (nettoyage) — rapides, confort d'utilisation
+3. **P4** (arrêt propre) + **P6** (nettoyage) — ✅ traités le 12/09/2026
 4. **P5** (parsing montants) — à faire avec un mini test manuel
 5. **P3** (reconnexion WSS) — ✅ traité le 11/09/2026, backoff exponentiel ajouté le 12/09/2026
 6. Les améliorations optionnelles si le bot doit tourner en production durable
@@ -137,5 +141,5 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 - [ ] Simuler une tx non minée → reprise de boucle sous 60 s (P1)
 - [ ] Simuler 2 events simultanés → une seule soumission (P2)
 - [x] Couper le réseau → log explicite / reconnexion (P3) — couvert par les tests watchdog 53–66
-- [ ] Reliquat < MIN → arrêt propre (P4)
+- [x] Reliquat < MIN → arrêt propre (P4)
 - [ ] `WITHDRAW_AMOUNT` avec >6 décimales → erreur explicite (P5)

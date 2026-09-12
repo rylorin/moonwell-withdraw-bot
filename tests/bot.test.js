@@ -37,6 +37,7 @@ const {
   createBalanceWiring,
   createBalanceMonitor,
   createWssWatchdog,
+  createShutdownHandler,
   DEFAULT_GAS_TIERS,
 } = bot;
 
@@ -1304,4 +1305,144 @@ test("loadConfig exposes the WSS watchdog knobs (defaults + env)", () => {
     1000,
     "backoff base clampé",
   );
+});
+
+// ---------------------------------------------------------------------------
+// P4 — dust below MIN_CHUNK stops the bot cleanly
+// ---------------------------------------------------------------------------
+
+test("P4: remaining dust below MIN_CHUNK stops cleanly", async () => {
+  const d = makeDeps({
+    fullBalance: true, // totalTarget: null → full-balance mode
+    initialBalanceUsd: 2, // 2 USDC raw = 2n * 10n ** 6n
+    minChunkUsdc: 5,
+    cash: 100, // plenty of market liquidity — the stop is about the dust
+  });
+
+  await d.runner.attemptChunk();
+
+  assert.equal(d.calls.exit, 1, "processExit(0) called → clean stop");
+  assert.ok(d.calls.destroyed >= 1, "provider destroyed at least once");
+  assert.ok(
+    d.logs.some((l) => /below the minimum chunk/.test(l)),
+    "dust must be reported as below the minimum chunk",
+  );
+  assert.ok(d.logs.some((l) => /Done/.test(l)), "must log that it is done");
+  assert.equal(d.runner.state.stopped, true);
+  assert.equal(d.runner.state.txInFlight, false);
+  assert.equal(d.calls.redeem, 0, "no redeem is ever attempted on dust");
+});
+
+test("P4: remaining exactly at MIN_CHUNK does NOT trigger early stop", async () => {
+  const d = makeDeps({
+    fullBalance: true,
+    initialBalanceUsd: 5, // == minChunkUsdc → not dust
+    minChunkUsdc: 5,
+    cash: 100,
+    // The redeem path is taken; the receipt reverts so the runner stops there
+    // without ever reaching its "Done" exit.
+    receipt: { status: 0, blockNumber: 900, logs: [] },
+  });
+
+  await d.runner.attemptChunk();
+
+  assert.equal(d.calls.exit, 0, "no early P4 exit at remaining === MIN_CHUNK");
+  assert.equal(
+    d.calls.redeem,
+    1,
+    "tries the actual redeem path instead of stopping on dust",
+  );
+  assert.ok(
+    !d.logs.some((l) => /below the minimum chunk/.test(l)),
+    "the P4 dust message must not appear",
+  );
+  assert.equal(d.runner.state.txInFlight, false);
+});
+
+// ---------------------------------------------------------------------------
+// P6 — graceful shutdown handler
+// ---------------------------------------------------------------------------
+
+/** Capture logs, errors and exit codes for the createShutdownHandler tests. */
+function makeShutdownDeps() {
+  const logs = [];
+  const errors = [];
+  const log = {
+    log: (m) => logs.push(String(m)),
+    error: (m, extra) => errors.push(String(m) + (extra ? " " + extra : "")),
+  };
+  const exitCalls = [];
+  return {
+    log,
+    logs,
+    errors,
+    exitCalls,
+    processExit: (code) => exitCalls.push(code),
+  };
+}
+
+test("shutdownHandler: SIGINT stops jobs, destroys providers, exit(0)", async () => {
+  const d = makeShutdownDeps();
+  let stopCalls = 0;
+  let destroyCalls = 0;
+  const shutdown = createShutdownHandler({
+    log: d.log,
+    processExit: d.processExit,
+    stops: [() => stopCalls++],
+    destroyers: [async () => destroyCalls++],
+    registerSignals: false,
+  });
+
+  await shutdown("SIGINT");
+
+  assert.equal(stopCalls, 1, "background jobs stopped");
+  assert.equal(destroyCalls, 1, "providers destroyed");
+  assert.deepEqual(d.exitCalls, [0], "exits 0 on a clean shutdown");
+  assert.ok(
+    d.logs.some((l) => /Graceful shutdown complete/.test(l)),
+    "must log the clean completion",
+  );
+});
+
+test("shutdownHandler: error in destroyer triggers exit(1)", async () => {
+  const d = makeShutdownDeps();
+  const shutdown = createShutdownHandler({
+    log: d.log,
+    processExit: d.processExit,
+    destroyers: [
+      async () => {
+        throw new Error("provider destroy failed");
+      },
+    ],
+    registerSignals: false,
+  });
+
+  await shutdown("SIGTERM");
+
+  assert.deepEqual(d.exitCalls, [1], "a failed shutdown exits 1");
+  assert.ok(
+    d.errors.some((e) => /Error during shutdown/.test(e)),
+    "must log the shutdown error",
+  );
+});
+
+test("shutdownHandler: idempotent (second call ignored)", async () => {
+  const d = makeShutdownDeps();
+  let stopCalls = 0;
+  let destroyCalls = 0;
+  const shutdown = createShutdownHandler({
+    log: d.log,
+    processExit: d.processExit,
+    stops: [() => stopCalls++],
+    destroyers: [async () => destroyCalls++],
+    registerSignals: false,
+  });
+
+  await shutdown("SIGINT");
+  await shutdown("SIGINT"); // ignored
+  await shutdown("SIGTERM"); // ignored too
+
+  assert.equal(stopCalls, 1, "stops run once");
+  assert.equal(destroyCalls, 1, "destroyers run once");
+  assert.equal(d.exitCalls.length, 1, "exits once");
 });

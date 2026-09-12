@@ -354,11 +354,12 @@ function createChunkRunner({
     },
   };
 
-  const done = async () => {
+  const done = async (message) => {
     log.log(
-      targetRaw === null
-        ? "Redeemable balance fully withdrawn. Done."
-        : "Target fully withdrawn. Done.",
+      message ??
+        (targetRaw === null
+          ? "Redeemable balance fully withdrawn. Done."
+          : "Target fully withdrawn. Done."),
     );
     state.stopped = true;
     current.provider.removeAllListeners("block");
@@ -400,6 +401,16 @@ function createChunkRunner({
       //    pool's cash says. This also covers a zero balance at startup (full
       //    mode) instead of looping forever on "Below MIN_CHUNK".
       if (state.remainingRaw <= 0n) {
+        await done();
+        return;
+      }
+
+      // P4: remaining below minimum chunk — dust that can never be withdrawn.
+      // Stop cleanly instead of looping "Below MIN_CHUNK" every block forever.
+      if (state.remainingRaw > 0n && state.remainingRaw < minChunkRaw) {
+        log.log(
+          `  -> Remaining ${fmt(state.remainingRaw)} USDC is below the minimum chunk (${config.minChunkUsdc} USDC) — nothing left to withdraw. Done.`,
+        );
         await done();
         return;
       }
@@ -860,6 +871,46 @@ function createWssWatchdog({
   return { tick, reset, stop, setProvider, state };
 }
 
+/**
+ * P6 — Graceful shutdown: stop background jobs, destroy providers, exit.
+ * Idempotent — a second signal is ignored.
+ */
+function createShutdownHandler({
+  log = console,
+  processExit = process.exit,
+  stops = [],       // sync callables that stop background jobs
+  destroyers = [],  // async callables that close/destroy resources
+  registerSignals = true,
+  signalOn = (sig, fn) => process.on(sig, fn),
+}) {
+  let shuttingDown = false;
+  const shutdown = async (signal = "SIGTERM") => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
+    try {
+      log.log("⏹️  Stopping background jobs...");
+      for (const s of stops) {
+        try { s(); } catch {}
+      }
+      log.log("🔌 Closing network connections...");
+      for (const d of destroyers) {
+        await (typeof d === "function" ? d() : d);
+      }
+      log.log("✅ Graceful shutdown complete");
+      processExit(0);
+    } catch (err) {
+      log.error("❌ Error during shutdown:", err);
+      processExit(1);
+    }
+  };
+  if (registerSignals) {
+    signalOn("SIGINT", () => shutdown("SIGINT"));
+    signalOn("SIGTERM", () => shutdown("SIGTERM"));
+  }
+  return shutdown;
+}
+
 // ---------- Entry point ----------
 
 async function main() {
@@ -903,6 +954,13 @@ async function main() {
   // keeps that load off the paid Alchemy connection. Block subscription and
   // transaction submission still go through the Alchemy WSS provider above.
   const readProvider = new ethers.JsonRpcProvider(config.readRpcUrl);
+  // P6: a dead read RPC must not crash the process — JsonRpcProvider emits
+  // "error" with no listener → Node would kill the bot on a network blip.
+  readProvider.on?.("error", (err) => {
+    console.warn(
+      `[readRpc] Read RPC error (${err.code || err.message || err}) — getCash() will fall back to the WSS provider.`,
+    );
+  });
   const mUsdcRead = new ethers.Contract(
     config.mUsdcAddress,
     MTOKEN_ABI,
@@ -981,13 +1039,16 @@ async function main() {
   });
   const { attemptChunk } = runner;
 
+  // P6: referenced by the shutdown handler so SIGINT/SIGTERM can stop it.
+  let monitor = null;
+
   // Balance monitor: re-reads the redeemable balance every
   // config.balanceMonitorIntervalMs, logs external changes and — while idle —
   // feeds the runner's knownBalance (the chunk cap). While a chunk is in
   // flight the read is only logged: the confirmation applies the exact
   // decrement, and the next idle read resyncs from on-chain truth.
   if (config.balanceMonitorIntervalMs > 0) {
-    const monitor = createBalanceMonitor({
+    monitor = createBalanceMonitor({
       mUsdcRead,
       walletAddress: wallet.address,
       intervalMs: config.balanceMonitorIntervalMs,
@@ -1062,6 +1123,18 @@ async function main() {
   );
   subscribe(provider);
   attemptChunk(); // run immediately on start, don't wait for the first block
+
+  // P6: graceful shutdown — SIGINT/SIGTERM → stop jobs → destroy providers → exit.
+  createShutdownHandler({
+    stops: [
+      ...(monitor ? [monitor.stop] : []),
+      watchdog.stop,
+    ],
+    destroyers: [
+      async () => { try { await provider.destroy(); } catch {} },
+      async () => { try { await readProvider.destroy(); } catch {} },
+    ],
+  });
 }
 
 if (require.main === module) {
@@ -1090,4 +1163,5 @@ module.exports = {
   createBalanceWiring,
   createBalanceMonitor,
   createWssWatchdog,
+  createShutdownHandler,
 };
