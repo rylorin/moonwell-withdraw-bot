@@ -1,6 +1,6 @@
 # PLAN — Correctifs & améliorations du bot Moonwell
 
-Statut : **P1, P2 & P3 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 63 tests). P4–P6 toujours ouverts.
+Statut : **P1, P2 & P3 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 66 tests). P4–P6 toujours ouverts.
 Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ## Barème de priorité
@@ -65,6 +65,8 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 **Correctif appliqué (11/09/2026)** : nouveau factory `createWssWatchdog` exporté — heartbeat (`WS_CHECK_MS`) + seuil de silence (`WS_STALL_MS`) ; sa propre souscription `block` alimente l'horloge, et les events `error` / `close` du provider/websocket sont loggés (URL masquée, jamais de clé). En cas de stall : si une tx est en vol, la reconnexion est différée (budget non consommé) ; sinon l'ancien provider est détruit, un nouveau est créé (`buildWss`), la souscription `block` est relancée et `runner.setConnection` rebranche la soumission sur le nouveau provider. Comportement piloté par `WS_ON_STALL` : `reconnect` (défaut, jusqu'à `WS_MAX_RECONNECTS` tentatives avant arrêt) ou `exit` (alerte + arrêt immédiat, également sur `close` du socket).
 
+Depuis le 12/09/2026, un échec de reconnexion (ex. DNS encore indisponible à la sortie de veille) ne fait plus sortir en erreur : une nouvelle tentative est planifiée après un délai de backoff exponentiel (`WS_BACKOFF_BASE_MS` = 5 s, ×2 par échec, plafonné à `WS_BACKOFF_MAX_MS` = 60 s), et le nouveau socket n'est adopté qu'après un health-check (`getBlockNumber` avec timeout de 5 s). Le budget par défaut est porté à 10 reconnexions (`WS_MAX_RECONNECTS`).
+
 **Critère de validation** : couper la connexion réseau en cours d'exécution → log explicite et soit reconnexion, soit arrêt propre. ✅ couvert par les tests `watchdog:*` (stall → reconnexion budgetée, `WS_ON_STALL=exit`, fermeture du socket, reconnexion différée, rebind `setProvider`, budget épuisé → `process.exit(1)`) et `runner: setConnection …`.
 
 ---
@@ -125,7 +127,7 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 2. **P1** (timeout + reprise de boucle) — la correction la plus importante pour la fiabilité
 3. **P4** (arrêt propre) + **P6** (nettoyage) — rapides, confort d'utilisation
 4. **P5** (parsing montants) — à faire avec un mini test manuel
-5. **P3** (reconnexion WSS) — ✅ traité le 11/09/2026
+5. **P3** (reconnexion WSS) — ✅ traité le 11/09/2026, backoff exponentiel ajouté le 12/09/2026
 6. Les améliorations optionnelles si le bot doit tourner en production durable
 
 ## Checklist de validation après traitement
@@ -134,6 +136,6 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 - [ ] Lancement à blanc sans vraie clé → erreurs placeholder toujours actives (pas de fuite de secrets)
 - [ ] Simuler une tx non minée → reprise de boucle sous 60 s (P1)
 - [ ] Simuler 2 events simultanés → une seule soumission (P2)
-- [x] Couper le réseau → log explicite / reconnexion (P3) — couvert par les tests watchdog 53–63
+- [x] Couper le réseau → log explicite / reconnexion (P3) — couvert par les tests watchdog 53–66
 - [ ] Reliquat < MIN → arrêt propre (P4)
 - [ ] `WITHDRAW_AMOUNT` avec >6 décimales → erreur explicite (P5)

@@ -40,6 +40,10 @@ const DEFAULT_READ_RPC_URL = "https://base.drpc.org";
 // Use a wss:// URL here (e.g. wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY).
 const DEFAULT_WSS_PLACEHOLDER = "PASTE_YOUR_WSS_URL_HERE";
 const DEFAULT_PRIVATE_KEY_PLACEHOLDER = "PASTE_YOUR_PRIVATE_KEY_HERE";
+// Sonde réseau avant d'adopter un socket WSS fraîchement construit : si le
+// DNS/socket ne répond pas (par ex. juste après un réveil de veille), on jette
+// ce socket et on rejette → le watchdog planifie un retry backoffé.
+const HEALTH_CHECK_MS = 5_000;
 
 /**
  * Build the config object from an `env` map (defaults to process.env).
@@ -81,7 +85,15 @@ function loadConfig(env = process.env) {
       : 5_000,
     wssMaxReconnects: env.WS_MAX_RECONNECTS
       ? Math.max(1, Number(env.WS_MAX_RECONNECTS) || 0)
-      : 5, // budget de vie du process, puis process.exit(1)
+      : 10, // budget de vie du process, puis process.exit(1)
+    // Backoff exponentiel entre les tentatives de reconnexion (5 s, 10 s, 20 s…
+    // plafonné à 60 s) : tolère un réseau éphémère — réveil de veille, DNS coupé.
+    wssBackoffBaseMs: env.WS_BACKOFF_BASE_MS
+      ? Math.max(1_000, Number(env.WS_BACKOFF_BASE_MS) || 0)
+      : 5_000,
+    wssBackoffMaxMs: env.WS_BACKOFF_MAX_MS
+      ? Math.max(1_000, Number(env.WS_BACKOFF_MAX_MS) || 0)
+      : 60_000,
     // "reconnect" (défaut) ou "exit" : arrêt immédiat sur stall/fermeture,
     // pour les déploiements pilotés par la politique de redémarrage Docker.
     wssOnStall: env.WS_ON_STALL === "exit" ? "exit" : "reconnect",
@@ -157,7 +169,16 @@ function logStartupParameters(config, { walletAddress }, log = console) {
     .join(" | ");
 
   log.log("==================================================");
-  log.log("Moonwell withdrawal bot — configuration");
+  const appVersion =
+    process.env.npm_package_version ||
+    (() => {
+      try {
+        return require("./package.json").version;
+      } catch {
+        return "N/A";
+      }
+    })();
+  log.log(`Moonwell withdrawal bot v${appVersion} — configuration`);
   log.log("--------------------------------------------------");
   log.log(`  mUSDC contract  : ${config.mUsdcAddress}`);
   log.log(
@@ -181,6 +202,8 @@ function logStartupParameters(config, { walletAddress }, log = console) {
   log.log(
     `  WSS watchdog     : silence ${config.wssStallMs / 1000} s | check ${
       config.wssCheckMs / 1000
+    } s | backoff ${config.wssBackoffBaseMs / 1000}→${
+      config.wssBackoffMaxMs / 1000
     } s`,
   );
   log.log(
@@ -627,7 +650,10 @@ function createBalanceMonitor({
  * `silenceTimeoutMs`), signale immédiatement les événements "error" / "close"
  * (URL masquée — jamais la clé API) et, en mode "reconnect" (défaut), déclenche
  * `onReconnect()` — une fois par cycle de silence, pas à chaque tick — dans la
- * limite du budget `maxReconnects` avant un `processExit(1)` propre. Avec
+ * limite du budget `maxReconnects` avant un `processExit(1)` propre. Un échec
+ * de reconnexion ne sort PAS en erreur : un retry est planifié après un délai
+ * croissant (`backoffBaseMs` ×2 jusqu'à `backoffMaxMs`) — un réseau éphémère
+ * (réveil de veille, DNS coupé) a ainsi le temps de revenir. Avec
  * `reconnect: false` (mode "exit" via WS_ON_STALL), tout stall ou close
  * provoque l'arrêt immédiat.
  *
@@ -642,11 +668,16 @@ function createWssWatchdog({
   now = Date.now,
   setTimer = setInterval,
   clearTimer = clearInterval,
+  scheduleRetry = (cb, ms) => setTimeout(cb, ms), // one-shot (backoff)
+  cancelRetry = (t) => clearTimeout(t),
   maskUrlFn = maskUrl,
   silenceTimeoutMs = 15_000,
   checkIntervalMs = 5_000,
   maxReconnects = 5,
   reconnect = true,
+  backoffBaseMs = 5_000, // premier délai après un échec
+  backoffMaxMs = 60_000, // plafond du délai (backoff exponentiel)
+  backoffFactor = 2, // 5 s → 10 s → 20 s → 40 s → 60 s (cap)
   onReconnect = null, // async () => void — rebâti et re-souscrit (main)
   shouldReconnect = () => true, // main injecte : !runner.state.txInFlight
   processExit = process.exit,
@@ -656,11 +687,20 @@ function createWssWatchdog({
     stallActive: false, // une escalade par cycle de silence
     stallCount: 0, // cycles de silence depuis le dernier reset()
     reconnectCount: 0, // budget cumulé — JAMAIS remis à zéro par reset()
+    backoffMs: backoffBaseMs, // délai courant entre deux tentatives
+    retryTimer: null, // one-shot en attente après un échec de reconnexion
     lastBlockAt: now(),
   };
   let timer = null;
   let exited = false;
   let boundProvider = null;
+
+  const cancelRetryTimer = () => {
+    if (state.retryTimer !== null) {
+      cancelRetry(state.retryTimer);
+      state.retryTimer = null;
+    }
+  };
 
   const tick = () => {
     state.lastBlockAt = now();
@@ -673,6 +713,7 @@ function createWssWatchdog({
       clearTimer(timer);
       timer = null;
     }
+    cancelRetryTimer();
     unbind();
   };
 
@@ -706,6 +747,8 @@ function createWssWatchdog({
     state.stallActive = false;
     state.stallCount = 0;
     state.socketDown = false; // on espère le nouveau socket
+    state.backoffMs = backoffBaseMs; // un cycle sain reboote le backoff
+    cancelRetryTimer(); // aucun retry one-shot en attente après un reset
     // reconnectCount volontairement conservé : budget de vie du process
   };
 
@@ -717,15 +760,31 @@ function createWssWatchdog({
       return;
     }
     state.socketDown = true;
-    if (state.stallActive) return; // déjà escaladé ce cycle de silence
+    if (state.stallActive) return; // déjà escaladé / retry backoffé en cours
     state.stallActive = true;
     state.stallCount++;
-    const secs = Math.round(idleMs / 1000);
 
     if (!reconnect)
       return fatal(
-        `  -> Aucun block reçu depuis ${secs} s — WS_ON_STALL=exit, arrêt du bot.`,
+        `  -> Aucun block reçu depuis ${Math.round(idleMs / 1000)} s — WS_ON_STALL=exit, arrêt du bot.`,
       );
+    attemptReconnect();
+  };
+
+  // Une tentative de reconnexion. Réussit → reset() ; échoue → un retry est
+  // planifié après un délai croissant (backoff exponentiel) au lieu de sortir
+  // en erreur — pensé pour un réseau éphémère (réveil de veille, Wi-Fi coupé,
+  // DNS indisponible).
+  const attemptReconnect = () => {
+    const idleMs = now() - state.lastBlockAt;
+    const secs = Math.round(idleMs / 1000);
+    // Les blocks ont repris pendant l'attente : la reconnexion est obsolète.
+    if (idleMs <= silenceTimeoutMs) {
+      state.socketDown = false;
+      state.stallActive = false;
+      state.backoffMs = backoffBaseMs;
+      return;
+    }
     if (
       typeof onReconnect !== "function" ||
       maxReconnects <= 0 ||
@@ -747,12 +806,35 @@ function createWssWatchdog({
     );
     Promise.resolve()
       .then(() => onReconnect())
-      .then(reset, (err) => {
-        log.error(
-          `  -> Échec de la reconnexion: ${(err && err.message) || err}`,
-        );
-        reset();
-      });
+      .then(
+        () => {
+          // Succès : le backoff repart de sa base, l'état est nettoyé.
+          state.backoffMs = backoffBaseMs;
+          reset();
+        },
+        (err) => {
+          log.error(
+            `  -> Échec de la reconnexion: ${(err && err.message) || err}`,
+          );
+          if (state.reconnectCount >= maxReconnects)
+            return fatal(
+              `  -> Budget de reconnexions épuisé (max ${maxReconnects}) après ${secs} s sans block. Arrêt du bot.`,
+            );
+          const delay = state.backoffMs;
+          state.backoffMs = Math.min(
+            state.backoffMs * backoffFactor,
+            backoffMaxMs,
+          );
+          log.warn(
+            `  -> Nouvelle tentative dans ${Math.round(delay / 1000)} s (backoff exponentiel).`,
+          );
+          cancelRetryTimer();
+          state.retryTimer = scheduleRetry(() => {
+            state.retryTimer = null;
+            attemptReconnect();
+          }, delay);
+        },
+      );
   };
 
   const unbind = () => {
@@ -795,6 +877,17 @@ async function main() {
   // P3: fabrique la triade provider/wallet/contrat sur le WSS Alchemy.
   function buildWss() {
     const p = new ethers.WebSocketProvider(config.wssUrl);
+    // Filet anti-crash : la lib `ws` émet 'error' avec AUCUN listener si le DNS
+    // est encore mort (réveil de veille) → Node tue le process. Ce listener est
+    // posé avant toute souscription ; le health-check ci-dessous décidera de
+    // garder ou de jeter ce socket. Windows de course : plus aucune.
+    p.websocket?.on?.("error", (err) => {
+      console.warn(
+        `[wss] Connexion impossible (${maskUrl(config.wssUrl)}): ${
+          err.code || err.message || err
+        }`,
+      );
+    });
     const w = new ethers.Wallet(config.privateKey, p);
     const m = new ethers.Contract(config.mUsdcAddress, MTOKEN_ABI, w);
     return { provider: p, wallet: w, mUsdc: m };
@@ -884,8 +977,7 @@ async function main() {
     provider,
     config,
     initialBalanceRaw: startingBalanceRaw,
-    readBalance: () =>
-      mUsdcRead.balanceOfUnderlying.staticCall(wallet.address),
+    readBalance: () => mUsdcRead.balanceOfUnderlying.staticCall(wallet.address),
   });
   const { attemptChunk } = runner;
 
@@ -920,6 +1012,27 @@ async function main() {
     }
     provider.removeAllListeners?.("block");
     const fresh = buildWss();
+    // Health-check réseau : sonde getBlockNumber() avant d'adopter le socket.
+    // Si le réseau est encore coupé (WSS indisponible), on détruit `fresh` et
+    // on REJETTE — le watchdog planifie alors un retry backoffé au lieu de se
+    // dire « réussi » sur un socket mort (cas du crash ENOTFOUND au réveil).
+    let probe;
+    try {
+      probe = await withTimeout(
+        fresh.provider.getBlockNumber(),
+        HEALTH_CHECK_MS,
+      );
+      if (probe.timedOut) throw new Error("WSS health-check: time out");
+    } catch (healthErr) {
+      try {
+        await fresh.provider.destroy();
+      } catch {
+        /* socket jamais ouvert */
+      }
+      throw new Error(
+        `WSS indisponible (${healthErr.code || healthErr.message || healthErr})`,
+      );
+    }
     runner.setConnection({ mUsdc: fresh.mUsdc, provider: fresh.provider });
     subscribe(fresh.provider); // AVANT de reprendre les blocks
     provider = fresh.provider; // le `let` scope main est recâblé
@@ -928,7 +1041,7 @@ async function main() {
     watchdog.setProvider(fresh.provider);
     watchdog.reset(); // ré-arme l'horloge du heartbeat
     console.log(
-      "Reconnexion WSS établie — surveillance des blocks relancée.\n",
+      `Reconnexion WSS établie (hauteur ${probe.value}) — surveillance des blocks relancée.\n`,
     );
   };
   const watchdog = createWssWatchdog({
@@ -938,6 +1051,8 @@ async function main() {
     checkIntervalMs: config.wssCheckMs,
     maxReconnects: config.wssMaxReconnects,
     reconnect: config.wssOnStall !== "exit",
+    backoffBaseMs: config.wssBackoffBaseMs,
+    backoffMaxMs: config.wssBackoffMaxMs,
     onReconnect: reconnectHandler,
     shouldReconnect: () => !runner.state.txInFlight,
   });

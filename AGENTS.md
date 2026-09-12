@@ -9,7 +9,7 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 ## Structure du projet
 
 - **`moonwell-withdraw-bot-chunked.js`** — Le bot complet (fichier unique)
-- **`tests/bot.test.js`** — Tests unitaires (`node --test`), 63 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
+- **`tests/bot.test.js`** — Tests unitaires (`node --test`), 66 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
 - **`README.md`** — Documentation utilisateur
 
 ## Stack technique
@@ -85,7 +85,7 @@ Attention : le script soumet de vraies transactions on-chain. Ne l'exécuter que
 
 - **P1** — `tx.wait()` encadré par `withTimeout()` (`TX_TIMEOUT_MS`, défaut 60 s). Au timeout, `getTxStatus()` donne le statut réel : `pending`/`dropped` → warning + reprise au bloc suivant sans décrémenter ; `mined` → receipt traité normalement.
 - **P2** — `txInFlight = true` posé immédiatement après le garde, avant tout `await`, pour éviter la double soumission au même nonce.
-- **P3 (11/09/2026)** — `createWssWatchdog()` surveille le WSS Alchemy : heartbeat + seuil de silence (`WS_STALL_MS`) détectent une coupure, les events `error`/`close` sont loggés (URL masquée via `maskUrl`, jamais de clé), et la reconnexion reconstruit le provider (`buildWss`) puis rebranche la souscription `block` via `runner.setConnection`. Comportement piloté par `WS_ON_STALL` (`reconnect` par défaut / `exit`) avec un budget `WS_MAX_RECONNECTS` ; reconnexion différée tant qu'une tx est en vol.
+- **P3 (11/09/2026)** — `createWssWatchdog()` surveille le WSS Alchemy : heartbeat + seuil de silence (`WS_STALL_MS`) détectent une coupure, les events `error`/`close` sont loggés (URL masquée via `maskUrl`, jamais de clé), et la reconnexion reconstruit le provider (`buildWss`) puis rebranche la souscription `block` via `runner.setConnection`. Comportement piloté par `WS_ON_STALL` (`reconnect` par défaut / `exit`) avec un budget `WS_MAX_RECONNECTS` ; reconnexion différée tant qu'une tx est en vol. Depuis le 12/09/2026, un échec de reconnexion (ex. ENOTFOUND au réveil de veille) déclenche un backoff exponentiel (`WS_BACKOFF_BASE_MS` 5 s → `WS_BACKOFF_MAX_MS` 60 s) au lieu d'un exit en erreur, le budget par défaut passe à 10 (`WS_MAX_RECONNECTS`), et un health-check (`getBlockNumber`, timeout 5 s) vérifie le nouveau socket avant de l'adopter.
 - **Diagnostics au démarrage** — `logStartupParameters()` affiche mUSDC_ADDRESS (avec lien BaseScan), wallet, WSS masqué, RPC, paliers de gaz, etc. Un solde nul déclenche un indice explicite (« vérifiez MUSDC_ADDRESS »).
 - **Surveillance du solde** — `createBalanceMonitor()` relit le solde décomposable sur le RPC de lecture toutes les `BALANCE_MONITOR_INTERVAL` s (défaut 60 s, `0` pour désactiver) et log les changements externes (dépôts, retraits manuels, intérêts).
 - **Re-synchronisation du solde (11/09/2026)** — le moniteur alimente désormais la logique de retrait via `createBalanceWiring()` : `remainingRaw` est un getter dérivé de `targetRaw - processedRaw` (mode cible fixe) ou de `knownBalanceRaw` (mode solde complet). Les dépôts externes sont retirés automatiquement, un retrait manuel réduit la cible. Garde anti-double-compte : une lecture du moniteur n'écrase `knownBalanceRaw` que si `!txInFlight`. `CHUNK_CAP_SOURCE` (`monitor`/`fresh`) choisit la source du plafond de chunk — sans moniteur, bascule automatique en `fresh` avec warning.

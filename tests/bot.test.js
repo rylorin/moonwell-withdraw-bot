@@ -901,6 +901,11 @@ function makeWatchdog(overrides = {}) {
   let hb = null;
   let checkDelay = -1;
   let cleared = 0;
+  // Retry one-shot (backoff) : un callback séparé du heartbeat, déclenché quand
+  // fakeNow atteint retryDueAt (maturité = date du dernier step).
+  let retryHb = null;
+  let retryDelay = -1;
+  let retryDueAt = -1;
   const setTimer = (cb, delay) => {
     hb = cb;
     checkDelay = delay;
@@ -908,6 +913,15 @@ function makeWatchdog(overrides = {}) {
   };
   const clearTimer = () => {
     cleared++;
+  };
+  const scheduleRetry = (cb, delay) => {
+    retryHb = cb;
+    retryDelay = delay;
+    retryDueAt = fakeNow + delay;
+    return "RETRY_TMR";
+  };
+  const cancelRetry = () => {
+    retryHb = null;
   };
   const listeners = { block: [], error: [], close: [] };
   const provider = {
@@ -939,6 +953,11 @@ function makeWatchdog(overrides = {}) {
     checkIntervalMs: overrides.checkIntervalMs ?? 5_000,
     maxReconnects: overrides.maxReconnects ?? 5,
     reconnect: overrides.reconnect ?? true,
+    backoffBaseMs: overrides.backoffBaseMs ?? 5_000,
+    backoffMaxMs: overrides.backoffMaxMs ?? 60_000,
+    backoffFactor: overrides.backoffFactor ?? 2,
+    scheduleRetry,
+    cancelRetry,
     onReconnect:
       overrides.onReconnect ??
       (async () => {
@@ -957,15 +976,24 @@ function makeWatchdog(overrides = {}) {
     exitCalls,
     reconnectCalls: () => reconnectCalls,
     checkDelay,
+    retryDelay: () => retryDelay,
     cleared: () => cleared,
     step: (ms) => {
       fakeNow += ms;
     },
     fire: async () => {
+      // Un retry one-shot venu à maturité passe en premier : c'est lui qui
+      // joue la reconnexion backoffée (le heartbeat est en revanche en attente
+      // derrière le garde stallActive).
+      if (retryHb && fakeNow >= retryDueAt) {
+        const cb = retryHb;
+        retryHb = null;
+        cb();
+      }
       hb();
-      // Drainage complet des microtâches: reset() (chaînée après onReconnect)
-      // doit être terminé avant le prochain heartbeat, comme en prod où les ticks
-      // sont espacés de checkIntervalMs.
+      // Drainage complet des microtâches: les rejets (→ backoff) ou reset()
+      // (succès) chaînés après onReconnect doivent être terminés avant le
+      // prochain heartbeat, comme en prod où les ticks sont espacés.
       await new Promise((resolve) => setImmediate(resolve));
     },
     block: () => wd.tick(),
@@ -1102,6 +1130,107 @@ test("watchdog: setProvider rebranche sur un nouveau provider sans crash", () =>
   assert.equal(t.wd.state.socketDown, false);
 });
 
+test("watchdog: reconnexion échouée → retry backoffé (5 s, 10 s…) puis succès", async () => {
+  let attempt = 0;
+  const t = makeWatchdog({
+    backoffBaseMs: 5_000,
+    backoffMaxMs: 60_000,
+    onReconnect: async () => {
+      attempt++;
+      if (attempt < 3) {
+        const e = new Error("getaddrinfo ENOTFOUND base-mainnet.g.alchemy.com");
+        e.code = "ENOTFOUND";
+        throw e;
+      }
+    },
+  });
+
+  t.step(20_000); // stall
+  await t.fire();
+  assert.equal(attempt, 1, "tentative 1");
+  assert.equal(t.wd.state.reconnectCount, 1);
+  assert.equal(t.retryDelay(), 5_000, "premier retry à +5 s");
+  assert.equal(t.wd.state.retryTimer, "RETRY_TMR", "retry en attente");
+  assert.ok(t.errors.some((e2) => /ENOTFOUND/.test(e2)), "erreur loggée");
+  assert.ok(
+    t.warns.some((w) => /Nouvelle tentative dans 5 s/.test(w)),
+    "délai annoncé",
+  );
+
+  t.step(5_000); // le retry de t+5 s arrive
+  await t.fire();
+  assert.equal(attempt, 2, "tentative 2 après 5 s d'attente");
+  assert.equal(t.retryDelay(), 10_000, "délai doublé (backoff)");
+  assert.ok(t.warns.some((w) => /dans 10 s/.test(w)), "backoff annoncé");
+
+  t.step(10_000); // le retry de t+10 s arrive
+  await t.fire();
+  assert.equal(attempt, 3, "tentative 3 — réussit");
+  assert.equal(t.wd.state.reconnectCount, 3);
+  assert.equal(t.wd.state.stallActive, false, "reset après succès");
+  assert.equal(t.wd.state.retryTimer, null, "plus de retry en attente");
+  assert.equal(t.wd.state.backoffMs, 5_000, "backoff remis à la base");
+});
+
+test("watchdog: la reprise des blocks annule un retry en attente", async () => {
+  let attempt = 0;
+  const t = makeWatchdog({
+    onReconnect: async () => {
+      attempt++;
+      throw new Error("getaddrinfo ENOTFOUND");
+    },
+  });
+
+  t.step(20_000);
+  await t.fire();
+  assert.equal(attempt, 1, "tentative 1 → échec → retry +5 s en attente");
+  assert.equal(t.wd.state.retryTimer, "RETRY_TMR");
+
+  // Un block arrive pendant l'attente : la connexion est visiblement revenue.
+  t.block();
+  t.step(5_000); // le retry serait à maturité…
+  await t.fire();
+  assert.equal(attempt, 1, "pas de tentative superflue sur un socket sain");
+  assert.equal(t.wd.state.stallActive, false, "cycle de stall clos");
+  assert.equal(t.wd.state.backoffMs, 5_000, "backoff remis à la base");
+});
+
+test("watchdog: échecs successifs → budget épuisé → process.exit(1) une seule fois", async () => {
+  let attempt = 0;
+  const t = makeWatchdog({
+    maxReconnects: 3,
+    backoffBaseMs: 1_000,
+    backoffMaxMs: 4_000,
+    onReconnect: async () => {
+      attempt++;
+      throw new Error("getaddrinfo ENOTFOUND base-mainnet.g.alchemy.com");
+    },
+  });
+
+  t.step(20_000);
+  await t.fire(); // 1/3 → échec → retry +1 s
+  assert.equal(attempt, 1);
+  assert.equal(t.retryDelay(), 1_000);
+
+  t.step(1_000);
+  await t.fire(); // 2/3 → échec → retry +2 s
+  assert.equal(attempt, 2);
+  assert.equal(t.retryDelay(), 2_000);
+
+  t.step(2_000);
+  await t.fire(); // 3/3 → échec → budget épuisé → exit(1)
+  assert.equal(attempt, 3);
+  assert.deepEqual(t.exitCalls, [1]);
+  assert.ok(t.errors.some((e) => /Budget de reconnexions épuisé/.test(e)));
+  assert.ok(t.warns.some((w) => /tentative de reconnexion 1\/3/.test(w)));
+
+  // plus rien après l'exit (aucun retry ni heartbeat actif)
+  t.step(4_000);
+  await t.fire();
+  assert.equal(attempt, 3);
+  assert.equal(t.exitCalls.length, 1, "process.exit une seule fois");
+});
+
 test("runner: setConnection swap la cible de soumission et le destroy", async () => {
   const d = makeDeps({ targetUsd: 100, cash: 100 });
   const mcalls = { redeem: 0, removeAll: 0, destroy: 0 };
@@ -1144,24 +1273,35 @@ test("loadConfig exposes the WSS watchdog knobs (defaults + env)", () => {
   const d = loadConfig({});
   assert.equal(d.wssStallMs, 15000);
   assert.equal(d.wssCheckMs, 5000);
-  assert.equal(d.wssMaxReconnects, 5);
+  assert.equal(d.wssMaxReconnects, 10, "backoff ⇒ budget plus permissif");
   assert.equal(d.wssOnStall, "reconnect");
+  assert.equal(d.wssBackoffBaseMs, 5000);
+  assert.equal(d.wssBackoffMaxMs, 60000);
 
   const e = loadConfig({
     WS_STALL_MS: "120000",
     WS_CHECK_MS: "30000",
     WS_MAX_RECONNECTS: "2",
     WS_ON_STALL: "exit",
+    WS_BACKOFF_BASE_MS: "10000",
+    WS_BACKOFF_MAX_MS: "120000",
   });
   assert.equal(e.wssStallMs, 120000);
   assert.equal(e.wssCheckMs, 30000);
   assert.equal(e.wssMaxReconnects, 2);
   assert.equal(e.wssOnStall, "exit");
+  assert.equal(e.wssBackoffBaseMs, 10000);
+  assert.equal(e.wssBackoffMaxMs, 120000);
 
   assert.equal(loadConfig({ WS_STALL_MS: "50" }).wssStallMs, 1000, "clamp min");
   assert.equal(
     loadConfig({ WS_MAX_RECONNECTS: "junk" }).wssMaxReconnects,
     1,
     "valeur invalide ≈ défaut sûr (NaN-safe)",
+  );
+  assert.equal(
+    loadConfig({ WS_BACKOFF_BASE_MS: "50" }).wssBackoffBaseMs,
+    1000,
+    "backoff base clampé",
   );
 });
