@@ -53,7 +53,7 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ## ✅ 🟡 P3 — Aucune reconnexion / surveillance du WSS Alchemy (TRAITÉ)
 
-**Localisation** : [createWssWatchdog (watchdog) ligne 638](../moonwell-withdraw-bot-chunked.js#L638), [watchdog instancié dans main() ligne 807](../moonwell-withdraw-bot-chunked.js#L807)
+**Localisation** : [createWssWatchdog (watchdog) ligne 664](../moonwell-withdraw-bot-chunked.js#L664), [watchdog instancié dans main() ligne 1047](../moonwell-withdraw-bot-chunked.js#L1047)
 
 **Problème** : aucun handler `error` / `close` sur `WebSocketProvider`. Si Alchemy ferme la connexion (idle, rate-limit, rebalance), les events `block` s'arrêtent **silencieusement** : le bot continue d'afficher des logs mais ne réagit plus.
 
@@ -65,7 +65,8 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 
 **Correctif appliqué (11/09/2026)** : nouveau factory `createWssWatchdog` exporté — heartbeat (`WS_CHECK_MS`) + seuil de silence (`WS_STALL_MS`) ; sa propre souscription `block` alimente l'horloge, et les events `error` / `close` du provider/websocket sont loggés (URL masquée, jamais de clé). En cas de stall : si une tx est en vol, la reconnexion est différée (budget non consommé) ; sinon l'ancien provider est détruit, un nouveau est créé (`buildWss`), la souscription `block` est relancée et `runner.setConnection` rebranche la soumission sur le nouveau provider. Comportement piloté par `WS_ON_STALL` : `reconnect` (défaut, jusqu'à `WS_MAX_RECONNECTS` tentatives avant arrêt) ou `exit` (alerte + arrêt immédiat, également sur `close` du socket).
 
-Depuis le 12/09/2026, un échec de reconnexion (ex. DNS encore indisponible à la sortie de veille) ne fait plus sortir en erreur : une nouvelle tentative est planifiée après un délai de backoff exponentiel (`WS_BACKOFF_BASE_MS` = 5 s, ×2 par échec, plafonné à `WS_BACKOFF_MAX_MS` = 60 s), et le nouveau socket n'est adopté qu'après un health-check (`getBlockNumber` avec timeout de 5 s). Le budget par défaut est porté à 10 reconnexions (`WS_MAX_RECONNECTS`).
+**Amélioration backoff (12/09/2026)** : une reconnexion échouée ne fait plus **quitter** le processus — elle est relancée en *backoff* exponentiel (`WS_BACKOFF_BASE_MS` = 5 s, ×2 par échec, plafonné à `WS_BACKOFF_MAX_MS` = 60 s). Le budget par défaut monte à **10** (`WS_MAX_RECONNECTS`) ; avec l'espacement du backoff, ~8 min de réseau absent peuvent être absorbées — de quoi survivre à un réveil de veille Mac dont la DNS est transitoirement morte (crash `getaddrinfo ENOTFOUND` sur le socket ws, à l'origine du correctif). Avant d'adopter un socket frais, une sonde de santé (`getBlockNumber` via `withTimeout`, 5 s) vérifie qu'il répond réellement.
+
 
 **Critère de validation** : couper la connexion réseau en cours d'exécution → log explicite et soit reconnexion, soit arrêt propre. ✅ couvert par les tests `watchdog:*` (stall → reconnexion budgetée, `WS_ON_STALL=exit`, fermeture du socket, reconnexion différée, rebind `setProvider`, budget épuisé → `process.exit(1)`) et `runner: setConnection …`.
 
