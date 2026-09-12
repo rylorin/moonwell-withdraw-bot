@@ -848,11 +848,18 @@ function createWssWatchdog({
       );
   };
 
+  // ethers v6 WebSocketProvider.websocket is a getter that *throws* when the
+  // underlying socket is already closed.  Optional-chaining does NOT protect
+  // against a throwing getter — we must catch explicitly.
+  const safeWs = (p) => {
+    try { return p?.websocket || null; } catch { return null; }
+  };
+
   const unbind = () => {
     if (!boundProvider) return;
     boundProvider.off?.("block", myBlockHandler);
     boundProvider.off?.("error", myErrorHandler);
-    boundProvider.websocket?.off?.("close", myCloseHandler);
+    safeWs(boundProvider)?.off?.("close", myCloseHandler);
     boundProvider = null;
   };
   const bind = (next) => {
@@ -861,7 +868,7 @@ function createWssWatchdog({
     boundProvider = next;
     next.on?.("block", myBlockHandler);
     next.on?.("error", myErrorHandler);
-    next.websocket?.on?.("close", myCloseHandler);
+    safeWs(next)?.on?.("close", myCloseHandler);
   };
   const setProvider = (next) => bind(next); // utilisé par main() après rebuild
 
@@ -932,7 +939,11 @@ async function main() {
     // est encore mort (réveil de veille) → Node tue le process. Ce listener est
     // posé avant toute souscription ; le health-check ci-dessous décidera de
     // garder ou de jeter ce socket. Windows de course : plus aucune.
-    p.websocket?.on?.("error", (err) => {
+    // WebSocketProvider.websocket can THROW after the socket closed; the
+    // getter must be guarded, optional-chaining does not suffice.
+    let pws = null;
+    try { pws = p.websocket; } catch { pws = null; }
+    pws?.on?.("error", (err) => {
       console.warn(
         `[wss] Connexion impossible (${maskUrl(config.wssUrl)}): ${
           err.code || err.message || err

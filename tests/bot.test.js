@@ -1446,3 +1446,109 @@ test("shutdownHandler: idempotent (second call ignored)", async () => {
   assert.equal(destroyCalls, 1, "destroyers run once");
   assert.equal(d.exitCalls.length, 1, "exits once");
 });
+
+// ---------------------------------------------------------------------------
+// Régression : getter ethers v6 WebSocketProvider.websocket qui THROW
+// ---------------------------------------------------------------------------
+
+test("watchdog: un getter websocket qui THROW après close ne crashe pas fatal() (régression)", async () => {
+  // ethers v6 WebSocketProvider.websocket est un getter qui *THROW* dès que le
+  // socket est mort. Autrefois, unbind() faisait
+  //   `boundProvider.websocket?.off?.("close", myCloseHandler)` :
+  // l'optional chaining ne protège pas d'un getter qui lève — le process
+  // mourait par rejet non géré au lieu d'appeler processExit(1) proprement.
+  //
+  // Scénario : deux tentatives avec budget maxReconnects=2.
+  //   - tentative 1 : l'ancien provider est détruit (close → getter toxique),
+  //     le rebranchement réussit (setProvider → unbind ancien → safeWs → OK),
+  //     puis l'erreur déclenche un retry backoffé.
+  //   - tentative 2 : l'ancien provider est détruit mais le rebranchement échoue
+  //     AVANT le swap → le provider courant reste détruit → fatal() → stop() →
+  //     unbind() traverse un getter qui THROW — le watchdog doit survivre.
+  const makeProvider = (name) => {
+    const wsHandlers = { block: [], error: [], close: [] };
+    return {
+      name,
+      closed: false,
+      close() {
+        this.closed = true;
+      },
+      get websocket() {
+        if (this.closed) throw new Error("websocket closed");
+        return {
+          on: (ev, cb) => (wsHandlers[ev] = wsHandlers[ev] || []).push(cb),
+          off: (ev, cb) => {
+            if (!wsHandlers[ev]) return;
+            wsHandlers[ev] = wsHandlers[ev].filter((f) => f !== cb);
+          },
+        };
+      },
+      on: (ev, cb) => (wsHandlers[ev] = wsHandlers[ev] || []).push(cb),
+      off: (ev, cb) => {
+        if (!wsHandlers[ev]) return;
+        wsHandlers[ev] = wsHandlers[ev].filter((f) => f !== cb);
+      },
+    };
+  };
+
+  const pB = makeProvider("B");
+  const pA = makeProvider("A");
+  let attempt = 0;
+  let current = pA;
+
+  const t = makeWatchdog({
+    maxReconnects: 2,
+    backoffBaseMs: 1_000,
+    backoffMaxMs: 4_000,
+    onReconnect: async () => {
+      attempt++;
+      current.close(); // le provider courant est détruit → getter toxique
+      if (attempt < 2) {
+        // rebranchement réussi : unbind(ancien au getter toxique) → safeWs
+        t.wd.setProvider(pB);
+        current = pB;
+        throw new Error("getaddrinfo ENOTFOUND base-mainnet.g.alchemy.com");
+      }
+      // dernière tentative : rebranchement échoue AVANT le swap, le provider
+      // courant reste l'ancien détruit → fatal() → stop() → unbind() → throw
+      throw new Error("getaddrinfo ENOTFOUND base-mainnet.g.alchemy.com");
+    },
+  });
+  t.wd.setProvider(pA); // pA devient le provider courant (bind sain)
+
+  t.step(20_000); // silence > 15 s → stall
+  await t.fire(); // tentative 1/2 → échec → retry +1 s
+  assert.equal(attempt, 1);
+  assert.equal(t.wd.state.reconnectCount, 1);
+
+  t.step(1_000); // le retry arrive à maturité
+  await t.fire(); // tentative 2/2 → échec → budget épuisé → fatal() → exit(1)
+  assert.equal(attempt, 2);
+  assert.deepEqual(t.exitCalls, [1], "processExit(1) appelé, pas de crash");
+  assert.equal(t.exitCalls.length, 1);
+});
+
+test("watchdog: getter websocket qui THROW dès le bind → stop()/fatal() propres", async () => {
+  // Variante du même piège : le provider courant a un getter .websocket qui
+  // throw dès le premier bind, sans aucun stall préalable. bind() et unbind()
+  // (via setProvider, stop, fatal) doivent tous survivre grâce à safeWs.
+  const t = makeWatchdog({
+    maxReconnects: 1,
+    onReconnect: async () => {
+      throw new Error("connexion impossible");
+    },
+  });
+  const poison = {
+    on: () => {},
+    off: () => {},
+    get websocket() {
+      throw new Error("websocket closed");
+    },
+  };
+  t.wd.setProvider(poison); // bind sur un getter qui throw immédiatement
+
+  t.step(20_000); // silence > 15 s → stall
+  await t.fire(); // tentative 1/1 → échec → fatal() → stop() → unbind(poison)
+  assert.deepEqual(t.exitCalls, [1], "processExit(1) appelé, pas de crash");
+  assert.equal(t.exitCalls.length, 1);
+});

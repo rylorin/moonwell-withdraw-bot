@@ -1,6 +1,6 @@
 # PLAN — Correctifs & améliorations du bot Moonwell
 
-Statut : **P1, P2, P3, P4 & P6 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 71 tests). P5 toujours ouvert.
+Statut : **P1, P2, P3, P4 & P6 traités** (sept. 2026 — correctifs appliqués + tests unitaires `tests/bot.test.js`, 73 tests). P5 toujours ouvert.
 Cible : `moonwell-withdraw-bot-chunked.js`.
 
 ## Barème de priorité
@@ -66,6 +66,8 @@ Cible : `moonwell-withdraw-bot-chunked.js`.
 **Correctif appliqué (11/09/2026)** : nouveau factory `createWssWatchdog` exporté — heartbeat (`WS_CHECK_MS`) + seuil de silence (`WS_STALL_MS`) ; sa propre souscription `block` alimente l'horloge, et les events `error` / `close` du provider/websocket sont loggés (URL masquée, jamais de clé). En cas de stall : si une tx est en vol, la reconnexion est différée (budget non consommé) ; sinon l'ancien provider est détruit, un nouveau est créé (`buildWss`), la souscription `block` est relancée et `runner.setConnection` rebranche la soumission sur le nouveau provider. Comportement piloté par `WS_ON_STALL` : `reconnect` (défaut, jusqu'à `WS_MAX_RECONNECTS` tentatives avant arrêt) ou `exit` (alerte + arrêt immédiat, également sur `close` du socket).
 
 **Amélioration backoff (12/09/2026)** : une reconnexion échouée ne fait plus **quitter** le processus — elle est relancée en *backoff* exponentiel (`WS_BACKOFF_BASE_MS` = 5 s, ×2 par échec, plafonné à `WS_BACKOFF_MAX_MS` = 60 s). Le budget par défaut monte à **10** (`WS_MAX_RECONNECTS`) ; avec l'espacement du backoff, ~8 min de réseau absent peuvent être absorbées — de quoi survivre à un réveil de veille Mac dont la DNS est transitoirement morte (crash `getaddrinfo ENOTFOUND` sur le socket ws, à l'origine du correctif). Avant d'adopter un socket frais, une sonde de santé (`getBlockNumber` via `withTimeout`, 5 s) vérifie qu'il répond réellement.
+
+**Correctif complémentaire (12/09/2026)** : le getter `WebSocketProvider.websocket` d'ethers v6 **lève** `Error("websocket closed")` une fois le socket détruit (il ne renvoie pas `null`) — l'optional chaining `?.` ne protège pas d'un getter qui throw. Au réveil de veille, `fatal()` → `stop()` → `unbind()` accédait à `boundProvider.websocket` (déjà mort) et faisait crasher le processus par un rejet non géré *au lieu* du `process.exit(1)` prévu — d'où l'impression que le backoff « ne fonctionnait pas » alors qu'il espaçait bien les 10 tentatives. `unbind()`/`bind()`/`buildWss()` accèdent désormais au socket uniquement via un helper `safeWs()` (`try { return p?.websocket || null } catch { return null }`). Tests de régression : `watchdog: un getter websocket qui THROW après close ne crashe pas fatal() (régression)` et `watchdog: getter websocket qui THROW dès le bind → stop()/fatal() propres`. ✅ 73 tests verts.
 
 **Critère de validation** : couper la connexion réseau en cours d'exécution → log explicite et soit reconnexion, soit arrêt propre. ✅ couvert par les tests `watchdog:*` (stall → reconnexion budgetée, `WS_ON_STALL=exit`, fermeture du socket, reconnexion différée, rebind `setProvider`, budget épuisé → `process.exit(1)`) et `runner: setConnection …`.
 
