@@ -27,6 +27,33 @@ require("dotenv").config();
 // ---------- CONFIG ----------
 const USDC_DECIMALS = 6;
 
+/**
+ * Parse a human-readable amount (e.g. "70000.123456") into raw BigInt units (6 decimals).
+ * Validates: > 0, at most 6 decimal places. Throws on invalid input.
+ * Pure — no side effects, unit-testable.
+ */
+function parseAmount(raw, decimals = USDC_DECIMALS) {
+  if (raw === undefined || raw === null || raw === "") {
+    throw new Error("amount is empty");
+  }
+  const s = String(raw).trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) {
+    throw new Error(`amount must be a positive decimal number, got "${raw}"`);
+  }
+  // Count decimals
+  const dot = s.indexOf(".");
+  if (dot !== -1 && s.length - dot - 1 > decimals) {
+    throw new Error(
+      `amount has more than ${decimals} decimal places (got ${s.length - dot - 1}): "${raw}"`,
+    );
+  }
+  const val = ethers.parseUnits(s, decimals);
+  if (val <= 0n) {
+    throw new Error(`amount must be > 0, got "${raw}"`);
+  }
+  return val;
+}
+
 // Fee tiers, ordered largest amount first. `GAS_TIERS.find` scans from the
 // top, so a chunk amount >= threshold picks that tier.
 const DEFAULT_GAS_TIERS = [
@@ -749,6 +776,10 @@ function createWssWatchdog({
         url ? maskUrlFn(url) : "URL non disponible"
       }). Les events block sont interrompus.`,
     );
+    if (reconnect)
+      log.log(
+        "  -> [reconnect] Le heartbeat va déclencher une reconnexion au prochain cycle.",
+      );
     if (!reconnect)
       fatal("  -> WS_ON_STALL=exit — arrêt immédiat à la fermeture du WSS.");
   };
@@ -813,7 +844,7 @@ function createWssWatchdog({
 
     state.reconnectCount++;
     log.warn(
-      `  -> Aucun block reçu depuis ${secs} s — tentative de reconnexion ${state.reconnectCount}/${maxReconnects}...`,
+      `  -> Aucun block reçu depuis ${secs} s — tentative de reconnexion ${state.reconnectCount}/${maxReconnects} (${maskUrlFn(url)})...`,
     );
     Promise.resolve()
       .then(() => onReconnect())
@@ -852,7 +883,11 @@ function createWssWatchdog({
   // underlying socket is already closed.  Optional-chaining does NOT protect
   // against a throwing getter — we must catch explicitly.
   const safeWs = (p) => {
-    try { return p?.websocket || null; } catch { return null; }
+    try {
+      return p?.websocket || null;
+    } catch {
+      return null;
+    }
   };
 
   const unbind = () => {
@@ -885,8 +920,8 @@ function createWssWatchdog({
 function createShutdownHandler({
   log = console,
   processExit = process.exit,
-  stops = [],       // sync callables that stop background jobs
-  destroyers = [],  // async callables that close/destroy resources
+  stops = [], // sync callables that stop background jobs
+  destroyers = [], // async callables that close/destroy resources
   registerSignals = true,
   signalOn = (sig, fn) => process.on(sig, fn),
 }) {
@@ -898,7 +933,9 @@ function createShutdownHandler({
     try {
       log.log("⏹️  Stopping background jobs...");
       for (const s of stops) {
-        try { s(); } catch {}
+        try {
+          s();
+        } catch {}
       }
       log.log("🔌 Closing network connections...");
       for (const d of destroyers) {
@@ -942,7 +979,11 @@ async function main() {
     // WebSocketProvider.websocket can THROW after the socket closed; the
     // getter must be guarded, optional-chaining does not suffice.
     let pws = null;
-    try { pws = p.websocket; } catch { pws = null; }
+    try {
+      pws = p.websocket;
+    } catch {
+      pws = null;
+    }
     pws?.on?.("error", (err) => {
       console.warn(
         `[wss] Connexion impossible (${maskUrl(config.wssUrl)}): ${
@@ -1113,7 +1154,9 @@ async function main() {
     watchdog.setProvider(fresh.provider);
     watchdog.reset(); // ré-arme l'horloge du heartbeat
     console.log(
-      `Reconnexion WSS établie (hauteur ${probe.value}) — surveillance des blocks relancée.\n`,
+      `Reconnexion WSS établie à la tentative ${watchdog.state.reconnectCount}/${
+        config.wssMaxReconnects
+      } (hauteur ${probe.value}) — surveillance des blocks relancée.\n`,
     );
   };
   const watchdog = createWssWatchdog({
@@ -1137,13 +1180,18 @@ async function main() {
 
   // P6: graceful shutdown — SIGINT/SIGTERM → stop jobs → destroy providers → exit.
   createShutdownHandler({
-    stops: [
-      ...(monitor ? [monitor.stop] : []),
-      watchdog.stop,
-    ],
+    stops: [...(monitor ? [monitor.stop] : []), watchdog.stop],
     destroyers: [
-      async () => { try { await provider.destroy(); } catch {} },
-      async () => { try { await readProvider.destroy(); } catch {} },
+      async () => {
+        try {
+          await provider.destroy();
+        } catch {}
+      },
+      async () => {
+        try {
+          await readProvider.destroy();
+        } catch {}
+      },
     ],
   });
 }
@@ -1175,4 +1223,5 @@ module.exports = {
   createBalanceMonitor,
   createWssWatchdog,
   createShutdownHandler,
+  parseAmount,
 };

@@ -2,3 +2,5 @@
 .env
 /node_modules/
 stack.yaml
+tests/bot.test.js.bak
+tests/bot.test.js.bak2
