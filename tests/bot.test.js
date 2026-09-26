@@ -776,6 +776,7 @@ function makeMonitor(overrides = {}) {
     balanceOfUnderlying: { staticCall: balanceOf },
   };
   const monitor = createBalanceMonitor({
+    config: loadConfig({}),
     mUsdcRead,
     walletAddress: "0xWallet",
     intervalMs: overrides.intervalMs ?? 60_000,

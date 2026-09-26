@@ -5,45 +5,19 @@
  */
 import { ethers } from "ethers";
 import "dotenv/config";
+import {
+  Config,
+  DEFAULT_GAS_TIERS,
+  DEFAULT_MUSDC_ADDRESS,
+  DEFAULT_PRIVATE_KEY_PLACEHOLDER,
+  DEFAULT_READ_RPC_URL,
+  DEFAULT_WSS_PLACEHOLDER,
+  loadConfig,
+  USDC_DECIMALS,
+} from "./config";
+import { GasTier } from "./types";
 
-// ---------- CONFIG ----------
-const USDC_DECIMALS = 6;
-
-interface GasTier {
-  minUsdc: number;
-  priorityGwei: string;
-  maxFeeGwei: string;
-}
-const DEFAULT_GAS_TIERS: GasTier[] = [
-  { minUsdc: 100, priorityGwei: "0.3", maxFeeGwei: "0.6" },
-  { minUsdc: 30, priorityGwei: "0.1", maxFeeGwei: "0.3" },
-  { minUsdc: 0, priorityGwei: "0.02", maxFeeGwei: "0.1" },
-];
-const DEFAULT_MUSDC_ADDRESS = "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22";
-const DEFAULT_READ_RPC_URL = "https://base.drpc.org";
-const DEFAULT_WSS_PLACEHOLDER = "PASTE_YOUR_WSS_URL_HERE";
-const DEFAULT_PRIVATE_KEY_PLACEHOLDER = "PASTE_YOUR_PRIVATE_KEY_HERE";
 const HEALTH_CHECK_MS = 5_000;
-
-interface Config {
-  wssUrl: string;
-  readRpcUrl: string;
-  privateKey: string;
-  mUsdcAddress: string;
-  totalTarget: number | null;
-  minChunkUsdc: number;
-  usdcDecimals: number;
-  gasTiers: GasTier[];
-  txTimeoutMs: number;
-  balanceMonitorIntervalMs: number;
-  chunkCapSource: "fresh" | "monitor";
-  wssStallMs: number;
-  wssCheckMs: number;
-  wssMaxReconnects: number;
-  wssBackoffBaseMs: number;
-  wssBackoffMaxMs: number;
-  wssOnStall: "exit" | "reconnect";
-}
 
 function parseAmount(raw: unknown, decimals = USDC_DECIMALS): bigint {
   if (raw === undefined || raw === null || raw === "") {
@@ -64,41 +38,6 @@ function parseAmount(raw: unknown, decimals = USDC_DECIMALS): bigint {
     throw new Error(`amount must be > 0, got "${raw}"`);
   }
   return val;
-}
-
-function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  return {
-    wssUrl: env.BASE_WSS_URL || DEFAULT_WSS_PLACEHOLDER,
-    readRpcUrl: env.BASE_READ_RPC_URL || DEFAULT_READ_RPC_URL,
-    privateKey: env.PRIVATE_KEY || DEFAULT_PRIVATE_KEY_PLACEHOLDER,
-    mUsdcAddress: env.MUSDC_ADDRESS || DEFAULT_MUSDC_ADDRESS,
-    totalTarget: env.WITHDRAW_AMOUNT ? parseFloat(env.WITHDRAW_AMOUNT) : null,
-    minChunkUsdc: env.MIN_CHUNK ? parseFloat(env.MIN_CHUNK) : 5,
-    usdcDecimals: USDC_DECIMALS,
-    gasTiers: DEFAULT_GAS_TIERS,
-    txTimeoutMs: Number(env.TX_TIMEOUT_MS) || 60_000,
-    balanceMonitorIntervalMs:
-      env.BALANCE_MONITOR_INTERVAL !== undefined
-        ? Number(env.BALANCE_MONITOR_INTERVAL) || 0
-        : 60_000,
-    chunkCapSource: env.CHUNK_CAP_SOURCE === "fresh" ? "fresh" : "monitor",
-    wssStallMs: env.WS_STALL_MS
-      ? Math.max(1_000, Number(env.WS_STALL_MS) || 0)
-      : 15_000,
-    wssCheckMs: env.WS_CHECK_MS
-      ? Math.max(1_000, Number(env.WS_CHECK_MS) || 0)
-      : 5_000,
-    wssMaxReconnects: env.WS_MAX_RECONNECTS
-      ? Math.max(1, Number(env.WS_MAX_RECONNECTS) || 0)
-      : 10,
-    wssBackoffBaseMs: env.WS_BACKOFF_BASE_MS
-      ? Math.max(1_000, Number(env.WS_BACKOFF_BASE_MS) || 0)
-      : 5_000,
-    wssBackoffMaxMs: env.WS_BACKOFF_MAX_MS
-      ? Math.max(1_000, Number(env.WS_BACKOFF_MAX_MS) || 0)
-      : 60_000,
-    wssOnStall: env.WS_ON_STALL === "exit" ? "exit" : "reconnect",
-  };
 }
 
 function checkPlaceholders(config: Config): string[] {
@@ -149,7 +88,7 @@ function logStartupParameters(
 ): void {
   const targetDesc =
     config.totalTarget !== null
-      ? `${config.totalTarget} USDC`
+      ? `${config.totalTarget} ${config.underlyingSymbol}`
       : "solde décomposable complet";
   const tierDesc = config.gasTiers
     .map(
@@ -176,7 +115,7 @@ function logStartupParameters(
   log.log(`  Wallet          : ${walletAddress}`);
   log.log(`  WSS endpoint    : ${maskUrl(config.wssUrl)}`);
   log.log(`  Read RPC        : ${config.readRpcUrl}`);
-  log.log(`  USDC decimals   : ${config.usdcDecimals}`);
+  log.log(`  ${config.underlyingSymbol} decimals : ${config.usdcDecimals}`);
   log.log(`  WITHDRAW_AMOUNT : ${targetDesc}`);
   log.log(`  MIN_CHUNK       : ${config.minChunkUsdc}`);
   log.log(`  CHUNK_CAP_SOURCE: ${config.chunkCapSource}`);
@@ -366,7 +305,7 @@ function createChunkRunner({
       }
       if (state.remainingRaw > 0n && state.remainingRaw < minChunkRaw) {
         log.log(
-          `  -> Remaining ${fmt(state.remainingRaw)} USDC is below the minimum chunk (${config.minChunkUsdc} USDC) — nothing left to withdraw. Done.`,
+          `  -> Remaining ${fmt(state.remainingRaw)} ${config.underlyingSymbol} is below the minimum chunk (${config.minChunkUsdc} ${config.underlyingSymbol}) — nothing left to withdraw. Done.`,
         );
         await done();
         return;
@@ -484,6 +423,7 @@ function createBalanceWiring(runner: {
 }
 
 interface BalanceMonitorDeps {
+  config: Config;
   mUsdcRead: ethers.Contract;
   walletAddress: string;
   intervalMs: number;
@@ -501,6 +441,7 @@ interface BalanceMonitor {
 }
 
 function createBalanceMonitor({
+  config,
   mUsdcRead,
   walletAddress,
   intervalMs,
@@ -528,9 +469,9 @@ function createBalanceMonitor({
         if (resolvedDecimals === null)
           resolvedDecimals = await mUsdcRead.decimals.staticCall();
         const lpRaw = await mUsdcRead.balanceOf.staticCall(walletAddress);
-        lpBalance = ` | LP tokens: ${ethers.formatUnits(lpRaw, resolvedDecimals || USDC_DECIMALS)}`;
+        lpBalance = `| LP tokens: ${ethers.formatUnits(lpRaw, resolvedDecimals || USDC_DECIMALS)}`;
       } catch {
-        lpBalance = " | LP tokens: n/a";
+        lpBalance = "| LP tokens: n/a";
       }
       const ts = new Date().toISOString();
       if (lastRaw !== null && raw !== lastRaw) {
@@ -538,10 +479,12 @@ function createBalanceMonitor({
         const sign = delta > 0n ? "+" : "-";
         const abs = delta < 0n ? -delta : delta;
         log.log(
-          `[${ts}] [balance] ${fmt(raw)} USDC${lpBalance} (${sign}${fmt(abs)} USDC depuis la dernière lecture — changement externe)`,
+          `[${ts}] [balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (${sign}${fmt(abs)} ${config.underlyingSymbol} depuis la dernière lecture — changement externe)`,
         );
       } else {
-        log.log(`[${ts}] [balance] ${fmt(raw)} USDC${lpBalance} (inchangé)`);
+        log.log(
+          `[${ts}] [balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (inchangé)`,
+        );
       }
       lastRaw = raw;
       onBalanceRead(raw);
@@ -938,6 +881,7 @@ async function main() {
   let monitor: BalanceMonitor | null = null;
   if (config.balanceMonitorIntervalMs > 0) {
     monitor = createBalanceMonitor({
+      config,
       mUsdcRead,
       walletAddress: wallet.address,
       intervalMs: config.balanceMonitorIntervalMs,

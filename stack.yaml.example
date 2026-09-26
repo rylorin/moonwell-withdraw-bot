@@ -1,0 +1,4 @@
+remote: root@_YOURVPS.com_
+rsync_image: eeacms/rsync:latest
+backup_keep: 5
+excludes: ["node_modules", ".claude", ".kilo", ".env"]

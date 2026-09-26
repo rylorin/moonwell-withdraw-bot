@@ -1,7 +1,7 @@
 FROM node:22
 
-COPY package.json /app/
-COPY moonwell-withdraw-bot-chunked.js /app/
+COPY package.json yarn.lock tsconfig.json /app/
+COPY src/ /app/src/
 RUN cd /app/ \
     && yarn install \
     && yarn build
