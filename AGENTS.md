@@ -14,10 +14,11 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 
 ## Stack technique
 
-- **Node.js >= 18**
+- **Node.js >= 22**
 - **ethers v6** (`const { ethers } = require("ethers")`) — attention : syntaxe v6, pas v5 (ex. `ethers.parseUnits`, pas `ethers.utils.parseUnits`)
 - **BigInt** natif pour les montants on-chain (unités brutes, 6 décimales pour USDC)
 - **Deux providers** : un RPC public pour les lectures (`JsonRpcProvider`), un WSS Alchemy pour les souscriptions de blocs et les soumissions (`WebSocketProvider`)
+- **Package manager** : `yarn` (à utiliser à la place de `npm`)
 
 ## Architecture du code
 
@@ -37,7 +38,7 @@ Toutes les constantes sont au début : `WSS_URL`, `PRIVATE_KEY`, `MUSDC_ADDRESS`
 - **Fallback RPC** : `getCash()` tente d'abord le RPC public, puis Alchemy en cas d'erreur. Ne pas simplifier en utilisant uniquement Alchemy — c'est une optimisation de coût délibérée.
 - **Vérification des `Failure` events** : pour les contrats Compound-fork, `receipt.status === 1` ne suffit pas. Il faut scanner les logs pour un event `Failure` et, le cas échéant, **ne pas** comptabiliser le chunk (ni incrémenter `processedRaw`, ni décrémenter `knownBalanceRaw`).
 - **Comptabilisation conditionnelle** : le succès on-chain n'incrémente que `processedRaw += chunk` (et décrémente `knownBalanceRaw -= chunk`). Rien n'est comptabilisé avant confirmation.
-- **Modèle de re-sync du solde** : `processedRaw` (montant traité) et `knownBalanceRaw` (solde connu, source unique du plafond de chunk) sont écrits aux seuls deux moments légitimes — confirmation on-chain et lecture du moniteur de balance. `remainingRaw` est un *getter* dérivé : `targetRaw - processedRaw` en mode cible fixe, `knownBalanceRaw` en mode solde complet (sans `WITHDRAW_AMOUNT`), donc les dépôts externes sont retirés automatiquement et un retrait manuel réduit la cible.
+- **Modèle de re-sync du solde** : `processedRaw` (montant traité) et `knownBalanceRaw` (solde connu, source unique du plafond de chunk) sont écrits aux seuls deux moments légitimes — confirmation on-chain et lecture du moniteur de balance. `remainingRaw` est un _getter_ dérivé : `targetRaw - processedRaw` en mode cible fixe, `knownBalanceRaw` en mode solde complet (sans `WITHDRAW_AMOUNT`), donc les dépôts externes sont retirés automatiquement et un retrait manuel réduit la cible.
 - **Garde anti-double-compte** : une lecture du moniteur de balance n'écrase `knownBalanceRaw` que si `!txInFlight` — jamais pendant qu'une transaction est en cours (évite de compter deux fois le même retrait).
 - **`CHUNK_CAP_SOURCE`** : `monitor` (dernière valeur lue par le moniteur, défaut) ou `fresh` (relecture du solde via le RPC de lecture à chaque tour). Sans moniteur (`BALANCE_MONITOR_INTERVAL=0`), le bot bascule en `fresh` avec un warning.
 - **Paliers de gaz** : `getGasForChunk()` choisit un palier selon le montant du chunk. Les paliers sont ordonnés du plus grand au plus petit montant (`GAS_TIERS.find`).

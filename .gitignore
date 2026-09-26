@@ -4,3 +4,5 @@
 stack.yaml
 tests/bot.test.js.bak
 tests/bot.test.js.bak2
+/.kilo/
+/dist/

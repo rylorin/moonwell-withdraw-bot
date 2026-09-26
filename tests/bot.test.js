@@ -22,7 +22,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { ethers } = require("ethers");
 
-const bot = require("../moonwell-withdraw-bot-chunked");
+const bot = require("../dist/moonwell-withdraw-bot-chunked");
 
 const {
   loadConfig,
@@ -160,8 +160,8 @@ function makeDeps(overrides = {}) {
   // The "known balance" seeds the chunk cap; in full-balance mode (no target)
   // it is also the remaining amount, since remainingRaw ≡ knownBalanceRaw.
   const initialBalUsd = overrides.fullBalance
-    ? overrides.initialBalanceUsd ?? 100
-    : overrides.initialBalanceUsd ?? overrides.targetUsd ?? 500;
+    ? (overrides.initialBalanceUsd ?? 100)
+    : (overrides.initialBalanceUsd ?? overrides.targetUsd ?? 500);
   const initialBalanceRaw = parse(String(initialBalUsd));
 
   const readBalance =
@@ -208,7 +208,11 @@ test("loadConfig applies its defaults", () => {
   assert.equal(c.txTimeoutMs, 60000);
   assert.equal(c.usdcDecimals, 6);
   assert.equal(c.gasTiers, DEFAULT_GAS_TIERS);
-  assert.equal(c.balanceMonitorIntervalMs, 60000, "default: monitor every 60 s");
+  assert.equal(
+    c.balanceMonitorIntervalMs,
+    60000,
+    "default: monitor every 60 s",
+  );
   assert.equal(c.chunkCapSource, "monitor");
 });
 
@@ -707,7 +711,11 @@ test("runner: fixed target — external withdrawal drops the balance; chunk is c
   );
   assert.equal(d.runner.state.remainingRaw, parse("470"), "target − processed");
   assert.equal(d.runner.state.knownBalanceRaw, 0n);
-  assert.equal(d.runner.state.stopped, false, "keeps trying — target not reached");
+  assert.equal(
+    d.runner.state.stopped,
+    false,
+    "keeps trying — target not reached",
+  );
 });
 
 test("runner: CHUNK_CAP_SOURCE=fresh reads the balance every round and caps the chunk", async () => {
@@ -855,7 +863,10 @@ test("balance monitor: repeated read failures warn and stop the monitor", async 
   monitor.start();
   for (let i = 0; i < 5; i++) await monitor.read();
   assert.equal(warns.length, 5);
-  assert.ok(warns.some((w) => /arrêté/.test(w)), "monitor must announce it stops");
+  assert.ok(
+    warns.some((w) => /arrêté/.test(w)),
+    "monitor must announce it stops",
+  );
   assert.equal(cleared, 1, "timer must be cleared once when giving up");
 });
 
@@ -873,7 +884,10 @@ test("balance monitor: LP-token balance appears on the balance line", async () =
 });
 
 test("balance monitor: a failing LP read degrades to n/a without killing the read", async () => {
-  const { monitor, logs } = makeMonitor({ balance: parse("100"), lpDecimals: 6 });
+  const { monitor, logs } = makeMonitor({
+    balance: parse("100"),
+    lpDecimals: 6,
+  });
   await monitor.read();
   assert.ok(logs[0].includes("| LP tokens: n/a"));
   assert.ok(logs[0].includes("USDC"), "underlying balance line still logged");
@@ -1152,7 +1166,10 @@ test("watchdog: reconnexion échouée → retry backoffé (5 s, 10 s…) puis su
   assert.equal(t.wd.state.reconnectCount, 1);
   assert.equal(t.retryDelay(), 5_000, "premier retry à +5 s");
   assert.equal(t.wd.state.retryTimer, "RETRY_TMR", "retry en attente");
-  assert.ok(t.errors.some((e2) => /ENOTFOUND/.test(e2)), "erreur loggée");
+  assert.ok(
+    t.errors.some((e2) => /ENOTFOUND/.test(e2)),
+    "erreur loggée",
+  );
   assert.ok(
     t.warns.some((w) => /Nouvelle tentative dans 5 s/.test(w)),
     "délai annoncé",
@@ -1162,7 +1179,10 @@ test("watchdog: reconnexion échouée → retry backoffé (5 s, 10 s…) puis su
   await t.fire();
   assert.equal(attempt, 2, "tentative 2 après 5 s d'attente");
   assert.equal(t.retryDelay(), 10_000, "délai doublé (backoff)");
-  assert.ok(t.warns.some((w) => /dans 10 s/.test(w)), "backoff annoncé");
+  assert.ok(
+    t.warns.some((w) => /dans 10 s/.test(w)),
+    "backoff annoncé",
+  );
 
   t.step(10_000); // le retry de t+10 s arrive
   await t.fire();
@@ -1327,7 +1347,10 @@ test("P4: remaining dust below MIN_CHUNK stops cleanly", async () => {
     d.logs.some((l) => /below the minimum chunk/.test(l)),
     "dust must be reported as below the minimum chunk",
   );
-  assert.ok(d.logs.some((l) => /Done/.test(l)), "must log that it is done");
+  assert.ok(
+    d.logs.some((l) => /Done/.test(l)),
+    "must log that it is done",
+  );
   assert.equal(d.runner.state.stopped, true);
   assert.equal(d.runner.state.txInFlight, false);
   assert.equal(d.calls.redeem, 0, "no redeem is ever attempted on dust");
