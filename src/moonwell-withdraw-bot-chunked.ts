@@ -16,6 +16,7 @@ import {
   USDC_DECIMALS,
 } from "./config";
 import { GasTier } from "./types";
+import { createLogger, logger } from "./logger";
 
 const HEALTH_CHECK_MS = 5_000;
 
@@ -283,7 +284,7 @@ function createChunkRunner({
     if (state.stopped || state.txInFlight) return;
     state.txInFlight = true;
     try {
-      const ts = new Date().toISOString();
+      // const ts = new Date().toISOString();
       let balanceRaw = state.knownBalanceRaw;
       if (capSource === "fresh") {
         if (typeof readBalance !== "function")
@@ -320,7 +321,7 @@ function createChunkRunner({
         cash = await current.mUsdc.getCash();
       }
       if (cash === 0n) {
-        log.debug(`[${ts}] No liquidity available. Waiting...`);
+        log.log(`No liquidity available. Waiting...`);
         return;
       }
       const { amount: chunk, belowMin } = computeChunk(
@@ -330,7 +331,7 @@ function createChunkRunner({
         balanceRaw,
       );
       log.log(
-        `[${ts}] Liquidity: ${fmt(cash)} | Known balance: ${fmt(balanceRaw)} | Remaining: ${fmt(state.remainingRaw)} | Chunk to attempt: ${fmt(chunk)}`,
+        `Liquidity: ${fmt(cash)} | Known balance: ${fmt(balanceRaw)} | Remaining: ${fmt(state.remainingRaw)} | Chunk to attempt: ${fmt(chunk)}`,
       );
       if (chunk <= 0n) {
         log.log("  -> Nothing to withdraw this round.");
@@ -473,17 +474,17 @@ function createBalanceMonitor({
       } catch {
         lpBalance = "| LP tokens: n/a";
       }
-      const ts = new Date().toISOString();
+      // const ts = new Date().toISOString();
       if (lastRaw !== null && raw !== lastRaw) {
         const delta = raw - lastRaw;
         const sign = delta > 0n ? "+" : "-";
         const abs = delta < 0n ? -delta : delta;
         log.log(
-          `[${ts}] [balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (${sign}${fmt(abs)} ${config.underlyingSymbol} depuis la dernière lecture — changement externe)`,
+          `[balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (${sign}${fmt(abs)} ${config.underlyingSymbol} depuis la dernière lecture — changement externe)`,
         );
       } else {
         log.log(
-          `[${ts}] [balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (inchangé)`,
+          `[balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (inchangé)`,
         );
       }
       lastRaw = raw;
@@ -837,7 +838,7 @@ async function main() {
     const lpBalanceRaw = await mUsdcRead.balanceOf.staticCall(wallet.address);
     lpBalanceDisplay = ` | LP tokens: ${ethers.formatUnits(lpBalanceRaw, lpTokenDecimals)}`;
   } catch (lpErr: unknown) {
-    console.log(
+    logger.log(
       `  (lecture du solde LP tokens impossible: ${(lpErr as Error).message || lpErr})`,
     );
   }
@@ -845,7 +846,7 @@ async function main() {
     startingBalanceRaw === 0n
       ? "  <-- 0 renvoyé: vérifiez MUSDC_ADDRESS (contrat mUSDC) et le réseau du RPC/WSS. Si l'adresse est fausse, le solde paraît nul."
       : "";
-  console.log(
+  logger.log(
     `Redeemable USDC balance: ${fmt(startingBalanceRaw)}${lpBalanceDisplay}${zeroBalanceHint}`,
   );
   const targetRaw =
@@ -858,17 +859,17 @@ async function main() {
     );
   }
   if (targetRaw !== null)
-    console.log(`Target total withdrawal: ${fmt(targetRaw)} USDC`);
+    logger.log(`Target total withdrawal: ${fmt(targetRaw)} USDC`);
   else {
-    console.log(
+    logger.log(
       "Mode solde complet — retirera la totalité du solde décomposable. Les",
     );
-    console.log("dépôts externes (moniteur de balance) seront suivis aussi.");
+    logger.log("dépôts externes (moniteur de balance) seront suivis aussi.");
   }
-  console.log(
+  logger.log(
     "Will take up to 100% of available liquidity per chunk, capped at the known balance.",
   );
-  console.log("Polling market liquidity...\n");
+  logger.log("Polling market liquidity...\n");
   const runner = createChunkRunner({
     mUsdc,
     mUsdcRead,
@@ -876,6 +877,7 @@ async function main() {
     config,
     initialBalanceRaw: startingBalanceRaw,
     readBalance: () => mUsdcRead.balanceOfUnderlying.staticCall(wallet.address),
+    log: logger,
   });
   const { attemptChunk } = runner;
   let monitor: BalanceMonitor | null = null;
@@ -888,6 +890,7 @@ async function main() {
       initialRaw: startingBalanceRaw,
       onBalanceRead: createBalanceWiring(runner),
       lpDecimals: lpTokenDecimals,
+      log: logger,
     });
     monitor.start();
     console.log(
@@ -926,7 +929,7 @@ async function main() {
     mUsdc = fresh.mUsdc;
     watchdog.setProvider(fresh.provider);
     watchdog.reset();
-    console.log(
+    logger.log(
       `Reconnexion WSS établie à la tentative ${watchdog.state.reconnectCount}/${config.wssMaxReconnects} (hauteur ${probe.value}) — surveillance des blocks relancée.\n`,
     );
   };
@@ -942,9 +945,7 @@ async function main() {
     onReconnect: reconnectHandler,
     shouldReconnect: () => !runner.state.txInFlight,
   });
-  console.log(
-    "Subscribing to new blocks — will check liquidity on each one.\n",
-  );
+  logger.log("Subscribing to new blocks — will check liquidity on each one.\n");
   subscribe(provider);
   attemptChunk();
   createShutdownHandler({
@@ -966,7 +967,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch((err) => {
-    console.error(err);
+    logger.error(err);
     process.exit(1);
   });
 }
@@ -992,4 +993,5 @@ module.exports = {
   createWssWatchdog,
   createShutdownHandler,
   parseAmount,
+  createLogger,
 };
