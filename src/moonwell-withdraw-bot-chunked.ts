@@ -17,6 +17,8 @@ import {
 } from "./config";
 import { GasTier } from "./types";
 import { createLogger, logger } from "./logger";
+import { fmt, maskUrl } from "./utils";
+import { BalanceMonitor, createBalanceMonitor } from "./balanceMonitor";
 
 const HEALTH_CHECK_MS = 5_000;
 
@@ -55,10 +57,6 @@ function checkPlaceholders(config: Config): string[] {
   return errors;
 }
 
-function fmt(raw: bigint): string {
-  return ethers.formatUnits(raw, USDC_DECIMALS);
-}
-
 const MTOKEN_ABI = [
   "function getCash() view returns (uint256)",
   "function balanceOfUnderlying(address owner) returns (uint256)",
@@ -67,20 +65,6 @@ const MTOKEN_ABI = [
   "function redeemUnderlying(uint256 redeemAmount) returns (uint256)",
   "event Failure(uint256 errorCode, uint256 info, uint256 detail)",
 ];
-
-function maskUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    u.search = "";
-    u.hash = "";
-    const parts = u.pathname.split("/").filter(Boolean);
-    if (parts.length > 0) parts[parts.length - 1] = "***";
-    u.pathname = "/" + parts.join("/");
-    return u.toString();
-  } catch {
-    return "(URL invalide)";
-  }
-}
 
 function logStartupParameters(
   config: Config,
@@ -321,7 +305,7 @@ function createChunkRunner({
         cash = await current.mUsdc.getCash();
       }
       if (cash === 0n) {
-        log.log(`No liquidity available. Waiting...`);
+        log.debug(`No liquidity available. Waiting...`);
         return;
       }
       const { amount: chunk, belowMin } = computeChunk(
@@ -334,11 +318,11 @@ function createChunkRunner({
         `Liquidity: ${fmt(cash)} | Known balance: ${fmt(balanceRaw)} | Remaining: ${fmt(state.remainingRaw)} | Chunk to attempt: ${fmt(chunk)}`,
       );
       if (chunk <= 0n) {
-        log.log("  -> Nothing to withdraw this round.");
+        log.debug("  -> Nothing to withdraw this round.");
         return;
       }
       if (belowMin) {
-        log.log(
+        log.debug(
           `  -> Below MIN_CHUNK (${config.minChunkUsdc}), skipping this round.`,
         );
         return;
@@ -421,91 +405,6 @@ function createBalanceWiring(runner: {
   return (raw: bigint) => {
     if (!runner.state.txInFlight) runner.state.knownBalanceRaw = raw;
   };
-}
-
-interface BalanceMonitorDeps {
-  config: Config;
-  mUsdcRead: ethers.Contract;
-  walletAddress: string;
-  intervalMs: number;
-  log?: Console;
-  initialRaw?: bigint | null;
-  onBalanceRead: (raw: bigint) => void;
-  setTimer?: typeof setInterval;
-  clearTimer?: typeof clearInterval;
-  lpDecimals?: number | null;
-}
-interface BalanceMonitor {
-  start: () => { stop: () => void };
-  read: () => Promise<void>;
-  stop: () => void;
-}
-
-function createBalanceMonitor({
-  config,
-  mUsdcRead,
-  walletAddress,
-  intervalMs,
-  log = console,
-  initialRaw = null,
-  onBalanceRead = () => {},
-  setTimer = setInterval,
-  clearTimer = clearInterval,
-  lpDecimals = null,
-}: BalanceMonitorDeps): BalanceMonitor {
-  let lastRaw: bigint | null = initialRaw;
-  let failures = 0;
-  let timer: NodeJS.Timeout | null = null;
-  const stop = () => {
-    if (timer) clearTimer(timer);
-    timer = null;
-  };
-  const read = async () => {
-    try {
-      const raw = await mUsdcRead.balanceOfUnderlying.staticCall(walletAddress);
-      failures = 0;
-      let lpBalance = "";
-      try {
-        let resolvedDecimals = lpDecimals;
-        if (resolvedDecimals === null)
-          resolvedDecimals = await mUsdcRead.decimals.staticCall();
-        const lpRaw = await mUsdcRead.balanceOf.staticCall(walletAddress);
-        lpBalance = `| LP tokens: ${ethers.formatUnits(lpRaw, resolvedDecimals || USDC_DECIMALS)}`;
-      } catch {
-        lpBalance = "| LP tokens: n/a";
-      }
-      // const ts = new Date().toISOString();
-      if (lastRaw !== null && raw !== lastRaw) {
-        const delta = raw - lastRaw;
-        const sign = delta > 0n ? "+" : "-";
-        const abs = delta < 0n ? -delta : delta;
-        log.log(
-          `[balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (${sign}${fmt(abs)} ${config.underlyingSymbol} depuis la dernière lecture — changement externe)`,
-        );
-      } else {
-        log.log(
-          `[balance] ${fmt(raw)} ${config.underlyingSymbol} ${lpBalance} (inchangé)`,
-        );
-      }
-      lastRaw = raw;
-      onBalanceRead(raw);
-    } catch (err: unknown) {
-      failures++;
-      const giveUp = failures >= 5;
-      log.warn(
-        `  -> balance read failed (${(err as Error).message || err})${giveUp ? " — moniteur de solde arrêté après erreurs répétées." : ""}`,
-      );
-      if (giveUp) stop();
-    }
-  };
-  const start = () => {
-    if (intervalMs > 0)
-      timer = setTimer(() => {
-        read().catch(() => {});
-      }, intervalMs);
-    return { stop };
-  };
-  return { start, read, stop };
 }
 
 interface WssWatchdogDeps {
@@ -869,7 +768,7 @@ async function main() {
   logger.log(
     "Will take up to 100% of available liquidity per chunk, capped at the known balance.",
   );
-  logger.log("Polling market liquidity...\n");
+  logger.log("Polling market liquidity...");
   const runner = createChunkRunner({
     mUsdc,
     mUsdcRead,
@@ -945,7 +844,7 @@ async function main() {
     onReconnect: reconnectHandler,
     shouldReconnect: () => !runner.state.txInFlight,
   });
-  logger.log("Subscribing to new blocks — will check liquidity on each one.\n");
+  logger.log("Subscribing to new blocks — will check liquidity on each one.");
   subscribe(provider);
   attemptChunk();
   createShutdownHandler({

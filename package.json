@@ -1,6 +1,6 @@
 {
   "name": "moonwell-withdraw-bot",
-  "version": "0.0.9",
+  "version": "0.0.12",
   "description": "Bot Node.js pour retirer des USDC de Moonwell (Base) en plusieurs chunks selon la liquidité disponible",
   "author": "weez2",
   "main": "moonwell-withdraw-bot-chunked.js",
@@ -38,6 +38,7 @@
   "devDependencies": {
     "@types/node": "^26.6.3",
     "@types/pino": "^7.0.5",
+    "husky": "^9.1.7",
     "prettier": "^3.9.6",
     "tsx": "^4.0.0",
     "typescript": "^7.0.2"

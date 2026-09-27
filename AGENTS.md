@@ -8,7 +8,10 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 
 ## Structure du projet
 
-- **`moonwell-withdraw-bot-chunked.js`** — Le bot complet (fichier unique)
+- **`src/moonwell-withdraw-bot-chunked.ts`** — Le bot complet (fichier unique TypeScript)
+- **`src/config.ts`** — Configuration et constantes
+- **`src/types.ts`** — Types TypeScript utilitaires
+- **`src/logger.ts`** — Système de logging structuré (console + file avec rotation quotidienne, 7 jours)
 - **`tests/bot.test.js`** — Tests unitaires (`node --test`), 73 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
 - **`README.md`** — Documentation utilisateur
 
@@ -22,11 +25,11 @@ Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moo
 
 ## Architecture du code
 
-### Configuration (haut de fichier)
+### Configuration (dans src/config.ts)
 
-Toutes les constantes sont au début : `WSS_URL`, `PRIVATE_KEY`, `MUSDC_ADDRESS`, `USDC_DECIMALS`, `TOTAL_TARGET`, `MIN_CHUNK`, `GAS_TIERS`. Les secrets se lisent via `process.env` avec des placeholders en fallback.
+Toutes les constantes sont au début : `wssUrl`, `privateKey`, `mUsdcAddress`, `usdcDecimals`, `totalTarget`, `minChunkUsdc`, `gasTiers`. Les secrets se lisent via `process.env` avec des placeholders en fallback.
 
-### Logique principale (fonction `main`)
+### Logique principale (fonction `main` dans src/moonwell-withdraw-bot-chunked.ts)
 
 1. **Validation** — Vérifie que les placeholders secrets ont été remplacés et que le montant cible ne dépasse pas le solde
 2. **Initialisation** — Crée wallet, contrats (signé + lecture)
@@ -92,3 +95,18 @@ Attention : le script soumet de vraies transactions on-chain. Ne l'exécuter que
 - **Re-synchronisation du solde (11/09/2026)** — le moniteur alimente désormais la logique de retrait via `createBalanceWiring()` : `remainingRaw` est un getter dérivé de `targetRaw - processedRaw` (mode cible fixe) ou de `knownBalanceRaw` (mode solde complet). Les dépôts externes sont retirés automatiquement, un retrait manuel réduit la cible. Garde anti-double-compte : une lecture du moniteur n'écrase `knownBalanceRaw` que si `!txInFlight`. `CHUNK_CAP_SOURCE` (`monitor`/`fresh`) choisit la source du plafond de chunk — sans moniteur, bascule automatique en `fresh` avec warning.
 - **P4 & P6 (12/09/2026)** — `createShutdownHandler()` : arrêt propre (SIGINT/SIGTERM), stop des jobs de fond (moniteur, watchdog) + destruction des providers WSS et RPC de lecture, idempotent ; `attemptChunk` s'arrête proprement quand le reliquat passe sous `MIN_CHUNK` (poussière) au lieu de boucler. 73 tests.
 - **P3 hardening (12/09/2026)** — le getter `WebSocketProvider.websocket` d'ethers v6 **lève** `Error("websocket closed")` une fois le socket détruit (il ne renvoie pas `null`) : l'optional chaining `?.` ne protège pas d'un getter qui throw. `unbind()`/`bind()`/`buildWss()` y accèdent désormais via un helper `safeWs()` qui capture l'exception — plus de crash non géré quand `fatal()` → `stop()` → `unbind()` traverse un provider mort : le bot sort via `process.exit(1)` proprement (c'était la cause du crash au réveil de veille malgré le backoff). Tests de régression ajoutés : `watchdog: un getter websocket qui THROW après close ne crashe pas fatal() (régression)` et `watchdog: getter websocket qui THROW dès le bind → stop()/fatal() propres`. 73 tests.
+
+### Logging
+
+Amélioration récente : le bot utilise désormais Pino avec un log structuré dual (console + file avec rotation quotidienne, conserve 7 jours). Les logs importants (info/warn/error) apparaissent dans la console et le fichier, les logs debug vont uniquement dans le fichier. Les secrets sont automatiquement masqués des logs pour la sécurité.
+
+### Version bumping
+
+Nouveau : le système supporte désormais l'incrémentation automatique de version via les commits. Les commits conventionnels incrémentent le versionnement sémantique :
+
+- `feat: ...` → incrémente la version mineure (0.0.1 → 0.1.0)
+- `fix: ...` → incrémente la version patch (0.0.1 → 0.0.2)
+- `release: ...` → incrémente la version patch
+- `BREAKING CHANGE:` → incrémente la version majeure (0.0.1 → 1.0.0)
+
+Le bump de version est déclenché par le hook pre-commit et s'exécute avant que le commit ne soit créé, en s'assurant que le bump de version fait partie du commit.

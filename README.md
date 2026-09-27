@@ -2,6 +2,8 @@
 
 Bot Node.js pour retirer des USDC du protocole Moonwell (Base) en plusieurs chunks. Conçu pour les grands retraits qui dépassent la liquidité disponible dans le pool en une seule transaction.
 
+> **Auteur original** : weez2 – merci infiniment pour la création et le maintien de ce projet.
+
 ## Fonctionnalités
 
 - **Retrait chunké** : Divise automatiquement les grands retraits en plusieurs transactions basées sur la liquidité disponible

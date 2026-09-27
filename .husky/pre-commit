@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-commit hook to bump version based on commit message
+
+# Run version bump script
+node scripts/version-bump.js
+
+# Verify package.json was updated and staged
+if git diff --cached --quiet package.json; then
+  echo "Version unchanged or not staged"
+else
+  echo "✅ package.json version updated and staged"
+fi
