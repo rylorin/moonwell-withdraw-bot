@@ -1,112 +1,123 @@
 # AGENTS.md
 
-Guide pour les agents IA et développeurs travaillant sur ce projet.
+Guide for AI agents and developers working on this project.
 
-## Vue d'ensemble
+## Overview
 
-Un script Node.js autonome (fichier unique) qui retire des USDC du protocole Moonwell sur Base en divisant les grands retraits en chunks. Aucun framework, aucune dépendance hors `ethers` v6.
+A Node.js script that withdraws USDC from the Moonwell protocol on Base by splitting large withdrawals into chunks. No framework, no dependencies other than `ethers` v6.
 
-## Structure du projet
+## Project Structure
 
-- **`src/moonwell-withdraw-bot-chunked.ts`** — Le bot complet (fichier unique TypeScript)
-- **`src/config.ts`** — Configuration et constantes
-- **`src/types.ts`** — Types TypeScript utilitaires
-- **`src/logger.ts`** — Système de logging structuré (console + file avec rotation quotidienne, 7 jours)
-- **`tests/bot.test.js`** — Tests unitaires (`node --test`), 73 tests, mocks uniquement (aucun réseau, aucune transaction réelle)
-- **`README.md`** — Documentation utilisateur
+- **`src/moonwell-withdraw-bot-chunked.ts`** — Main program
+- **`src/config.ts`** — Configuration and constants
+- **`src/types.ts`** — Utility TypeScript types
+- **`src/logger.ts`** — Structured logging system (console + file with daily rotation, 7 days retention)
+- **`src/balanceMonitor.ts`** — Balance monitoring (reads disposable balance on the read RPC at configured intervals, logs external changes)
+- **`src/chunkRunner.ts`** — Core withdrawal loop (`createChunkRunner`, `computeChunk`), exports `state.{stopped,txInFlight,processedRaw,knownBalanceRaw,remainingRaw}`
+- **`src/watchdog.ts`** — WSS watchdog (heartbeat, stall detection, reconnection with backoff)
+- **`src/utils.ts`** — Shared utilities (`fmt`, `getGasForChunk`, `withTimeout`, `getTxStatus`, `createBalanceWiring`, `parseAmount`, `checkPlaceholders`, `logStartupParameters`, `maskUrl`)
+- **`tests/bot.test.js`** — Unit tests (`node --test`), 73 tests, mocks only (no network, no real transactions)
+- **`README.md`** — User documentation
 
-## Stack technique
+## Technical Stack
 
 - **Node.js >= 22**
-- **ethers v6** (`const { ethers } = require("ethers")`) — attention : syntaxe v6, pas v5 (ex. `ethers.parseUnits`, pas `ethers.utils.parseUnits`)
-- **BigInt** natif pour les montants on-chain (unités brutes, 6 décimales pour USDC)
-- **Deux providers** : un RPC public pour les lectures (`JsonRpcProvider`), un WSS Alchemy pour les souscriptions de blocs et les soumissions (`WebSocketProvider`)
-- **Package manager** : `yarn` (à utiliser à la place de `npm`)
+- **ethers v6** (`const { ethers } = require("ethers")`) — note: v6 syntax, not v5 (e.g. `ethers.parseUnits`, not `ethers.utils.parseUnits`)
+- **Native BigInt** for on-chain amounts (raw units, 6 decimals for USDC)
+- **Two providers**: a public RPC for reads (`JsonRpcProvider`), an Alchemy WSS for subscriptions and submissions (`WebSocketProvider`)
+- **Package manager**: `yarn` (use instead of `npm`)
 
-## Architecture du code
+## Code Architecture
 
-### Configuration (dans src/config.ts)
+### Configuration (in src/config.ts)
 
-Toutes les constantes sont au début : `wssUrl`, `privateKey`, `mUsdcAddress`, `usdcDecimals`, `totalTarget`, `minChunkUsdc`, `gasTiers`. Les secrets se lisent via `process.env` avec des placeholders en fallback.
+All constants at the top: `wssUrl`, `privateKey`, `mUsdcAddress`, `usdcDecimals`, `totalTarget`, `minChunkUsdc`, `gasTiers`. Secrets read via `process.env` with placeholder fallbacks.
 
-### Logique principale (fonction `main` dans src/moonwell-withdraw-bot-chunked.ts)
+### Main logic (function `main` in src/moonwell-withdraw-bot-chunked.ts)
 
-1. **Validation** — Vérifie que les placeholders secrets ont été remplacés et que le montant cible ne dépasse pas le solde
-2. **Initialisation** — Crée wallet, contrats (signé + lecture)
-3. **`attemptChunk()`** — La boucle de retrait, déclenchée à chaque nouveau bloc
+1. **Validation** — Checks secret placeholders are replaced and target does not exceed balance
+2. **Initialization** — Creates wallet, contracts (signed + read-only)
+3. **`attemptChunk()`** — The withdrawal loop, triggered on each new block
 
-### Points clés à respecter
+### Key Rules to Follow
 
-- **Garde `txInFlight`** : la fermeture `attemptChunk` refuse de soumettre une nouvelle transaction si une est déjà en cours. Ne pas retirer ce garde sans comprendre la raison (évite les nonces en conflit).
-- **Fallback RPC** : `getCash()` tente d'abord le RPC public, puis Alchemy en cas d'erreur. Ne pas simplifier en utilisant uniquement Alchemy — c'est une optimisation de coût délibérée.
-- **Vérification des `Failure` events** : pour les contrats Compound-fork, `receipt.status === 1` ne suffit pas. Il faut scanner les logs pour un event `Failure` et, le cas échéant, **ne pas** comptabiliser le chunk (ni incrémenter `processedRaw`, ni décrémenter `knownBalanceRaw`).
-- **Comptabilisation conditionnelle** : le succès on-chain n'incrémente que `processedRaw += chunk` (et décrémente `knownBalanceRaw -= chunk`). Rien n'est comptabilisé avant confirmation.
-- **Modèle de re-sync du solde** : `processedRaw` (montant traité) et `knownBalanceRaw` (solde connu, source unique du plafond de chunk) sont écrits aux seuls deux moments légitimes — confirmation on-chain et lecture du moniteur de balance. `remainingRaw` est un _getter_ dérivé : `targetRaw - processedRaw` en mode cible fixe, `knownBalanceRaw` en mode solde complet (sans `WITHDRAW_AMOUNT`), donc les dépôts externes sont retirés automatiquement et un retrait manuel réduit la cible.
-- **Garde anti-double-compte** : une lecture du moniteur de balance n'écrase `knownBalanceRaw` que si `!txInFlight` — jamais pendant qu'une transaction est en cours (évite de compter deux fois le même retrait).
-- **`CHUNK_CAP_SOURCE`** : `monitor` (dernière valeur lue par le moniteur, défaut) ou `fresh` (relecture du solde via le RPC de lecture à chaque tour). Sans moniteur (`BALANCE_MONITOR_INTERVAL=0`), le bot bascule en `fresh` avec un warning.
-- **Paliers de gaz** : `getGasForChunk()` choisit un palier selon le montant du chunk. Les paliers sont ordonnés du plus grand au plus petit montant (`GAS_TIERS.find`).
-- **Arrêt** : quand `remainingRaw <= 0n`, le bot supprime les listeners, détruit le provider et appelle `process.exit(0)`.
+- **`txInFlight` guard**: `attemptChunk` refuses to submit a new tx if one is already in flight. Do not remove this guard without understanding why (prevents nonce conflicts).
+- **RPC fallback**: `getCash()` tries public RPC first, then Alchemy on error. Do not simplify to only Alchemy — this is a deliberate cost optimization.
+- **`Failure` event verification**: for Compound-fork contracts, `receipt.status === 1` is not enough. Must scan logs for a `Failure` event; if found, **do not** count the chunk (do not increment `processedRaw` or decrement `knownBalanceRaw`).
+- **Conditional accounting**: on-chain success only increments `processedRaw += chunk` (and decrements `knownBalanceRaw -= chunk`). Nothing is counted before confirmation.
+- **Balance re-sync model**: `processedRaw` (amount processed) and `knownBalanceRaw` (known balance, single source of truth for chunk cap) are written at only two legitimate moments — on-chain confirmation and balance monitor read. `remainingRaw` is a derived **getter**: `targetRaw - processedRaw` in fixed-target mode, `knownBalanceRaw` in full-balance mode (no `WITHDRAW_AMOUNT`), so external deposits are auto-absorbed and a manual withdrawal reduces the target.
+- **Anti-double-count guard**: a balance monitor read only overwrites `knownBalanceRaw` if `!txInFlight` — never while a tx is in flight (avoids counting the same withdrawal twice).
+- **`CHUNK_CAP_SOURCE`**: `monitor` (last value read by the monitor, default) or `fresh` (re-read balance via the read RPC each round). Without a monitor (`BALANCE_MONITOR_INTERVAL=0`), the bot switches to `fresh` with a warning.
+- **Gas tiers**: `getGasForChunk()` picks a tier based on chunk amount. Tiers are ordered largest-to-smallest amount (`GAS_TIERS.find`).
+- **Stop**: when `remainingRaw <= 0n`, the bot removes listeners, destroys the provider, and calls `process.exit(0)`. With `stopAfterCompletion=false` it continues monitoring for new deposits instead.
 
 ## Conventions
 
-- Les montants en unités brutes sont des `BigInt` (suffixe `n` dans les comparaisons : `remainingRaw <= 0n`, `cash === 0n`)
-- `fmt(raw)` convertit en unités humaines via `ethers.formatUnits(raw, USDC_DECIMALS)`
-- Les messages de log sont préfixés par `->` pour l'indentation et horodatés `[ISO]` pour les boucles
-- Les erreurs de chunk sont catchées et loggées, puis la boucle continue (le bot ne doit pas mourir sur une erreur transitoire)
+- Raw amounts are `BigInt` (`n` suffix in comparisons: `remainingRaw <= 0n`, `cash === 0n`)
+- `fmt(raw)` converts to human units via `ethers.formatUnits(raw, USDC_DECIMALS)`
+- Log messages prefixed with `->` for indentation, timestamped `[ISO]` for loops
+- Chunk errors are caught and logged, then loop continues (bot must not die on transient errors)
 
-## Pièges courants
+## Common Pitfalls
 
-- **ethers v6 vs v5** : `ethers.WebSocketProvider`, `parseUnits`/`formatUnits`/`parseLog`/`staticCall` sont des méthodes v6. Ne pas les remplacer par des équivalents v5.
-- **Décimales** : `USDC_DECIMALS = 6`. Toute conversion de montant doit passer par `parseUnits`/`formatUnits` avec cette constante.
-- **Gestion des listeners** : `provider.removeAllListeners("block")` est appelé avant `process.exit` — s'assurer que toute modification de l'arrêt le conserve.
+- **ethers v6 vs v5**: `ethers.WebSocketProvider`, `parseUnits`/`formatUnits`/`parseLog`/`staticCall` are v6 methods. Do not replace with v5 equivalents.
+- **Decimals**: `USDC_DECIMALS = 6`. All amount conversions must use `parseUnits`/`formatUnits` with this constant.
+- **Listener management**: `provider.removeAllListeners("block")` is called before `process.exit` — ensure any shutdown modification keeps it.
+- **`STOP_AFTER_COMPLETION`**: controls whether the bot exits after finishing withdrawals. Default `true` in target mode (`WITHDRAW_AMOUNT` set), `false` in full-balance mode.
 
-## Sécurité
+## Security
 
-- Ne jamais introduire de clé privée en dur dans le code — toujours via `process.env`
-- Ne pas logger les secrets
-- Les adresses de contrats sont fixes et vérifiées sur BaseScan
+- Never hardcode a private key in code — always via `process.env`
+- Never log secrets
+- Contract addresses are fixed and verified on BaseScan
 
-## Tests / exécution
+## Tests / Execution
 
-Suite de tests unitaires via le runner natif Node (`node:test`) — aucun réseau, aucune transaction réelle, providers et contrats mockés :
+Unit test suite via Node's native runner (`node:test`) — no network, no real transactions, providers and contracts mocked:
 
 ```bash
-node --test        # ou: yarn test
-node --check moonwell-withdraw-bot-chunked.js   # vérification syntaxe
+node --test        # or: yarn test
+node --check moonwell-withdraw-bot-chunked.js   # syntax check
 ```
 
-Les fonctions pures (`loadConfig`, `getGasForChunk`, `withTimeout`, `getTxStatus`, `computeChunk`) et le runner (`createChunkRunner`, avec état `state.{stopped,txInFlight,processedRaw,knownBalanceRaw,remainingRaw}`) sont exportés par le fichier précisément pour être testables. Le helper `createBalanceWiring` est également exporté pour connecter le moniteur de balance au runner. Les tests couvrent les correctifs **P1**, **P2** et **P3** (watchdog WSS + reconnexion) ainsi que le modèle de re-sync du solde : mode solde complet, réaction aux dépôts/ retraits externes, garde anti-double-compte, bascule monitor→fresh.
+**Every change must pass the full test suite (`yarn test`) before being considered valid.**
 
-Pour exécuter le bot :
+Pure functions (`loadConfig`, `getGasForChunk`, `withTimeout`, `getTxStatus`, `computeChunk`) and the runner (`createChunkRunner`, with `state.{stopped,txInFlight,processedRaw,knownBalanceRaw,remainingRaw}`) are exported precisely for testability. The `createBalanceWiring` helper is also exported to wire the balance monitor to the runner. Tests cover fixes **P1**, **P2**, **P3** (WSS watchdog + reconnection) and the balance re-sync model: full-balance mode, reaction to external deposits/withdrawals, anti-double-count guard, monitor→fresh switching.
+
+To run the bot:
 
 ```bash
 BASE_WSS_URL="wss://..." PRIVATE_KEY="..." node moonwell-withdraw-bot-chunked.js
 ```
 
-Attention : le script soumet de vraies transactions on-chain. Ne l'exécuter que dans un contexte de test contrôlé ou en production délibérée.
+Warning: the script submits real on-chain transactions. Only run in a controlled test context or deliberate production.
 
-### Correctifs appliqués (09/09/2026)
+### Fixes Applied (09/09/2026)
 
-- **P1** — `tx.wait()` encadré par `withTimeout()` (`TX_TIMEOUT_MS`, défaut 60 s). Au timeout, `getTxStatus()` donne le statut réel : `pending`/`dropped` → warning + reprise au bloc suivant sans décrémenter ; `mined` → receipt traité normalement.
-- **P2** — `txInFlight = true` posé immédiatement après le garde, avant tout `await`, pour éviter la double soumission au même nonce.
-- **P3 (11/09/2026)** — `createWssWatchdog()` surveille le WSS Alchemy : heartbeat + seuil de silence (`WS_STALL_MS`) détectent une coupure, les events `error`/`close` sont loggés (URL masquée via `maskUrl`, jamais de clé), et la reconnexion reconstruit le provider (`buildWss`) puis rebranche la souscription `block` via `runner.setConnection`. Comportement piloté par `WS_ON_STALL` (`reconnect` par défaut / `exit`) avec un budget `WS_MAX_RECONNECTS` ; reconnexion différée tant qu'une tx est en vol. Depuis le 12/09/2026 : un échec de reconnexion (ex. `getaddrinfo ENOTFOUND` au réveil de veille) ne sort plus du processus — les tentatives retentent en backoff exponentiel (`WS_BACKOFF_BASE_MS` 5 s → plafond `WS_BACKOFF_MAX_MS` 60 s), le budget par défaut passe à 10 (`WS_MAX_RECONNECTS`), et une sonde de santé `getBlockNumber` (timeout 5 s) vérifie le socket frais avant de l'adopter.
-- **Diagnostics au démarrage** — `logStartupParameters()` affiche mUSDC_ADDRESS (avec lien BaseScan), wallet, WSS masqué, RPC, paliers de gaz, etc. Un solde nul déclenche un indice explicite (« vérifiez MUSDC_ADDRESS »).
-- **Surveillance du solde** — `createBalanceMonitor()` relit le solde décomposable sur le RPC de lecture toutes les `BALANCE_MONITOR_INTERVAL` s (défaut 60 s, `0` pour désactiver) et log les changements externes (dépôts, retraits manuels, intérêts).
-- **Re-synchronisation du solde (11/09/2026)** — le moniteur alimente désormais la logique de retrait via `createBalanceWiring()` : `remainingRaw` est un getter dérivé de `targetRaw - processedRaw` (mode cible fixe) ou de `knownBalanceRaw` (mode solde complet). Les dépôts externes sont retirés automatiquement, un retrait manuel réduit la cible. Garde anti-double-compte : une lecture du moniteur n'écrase `knownBalanceRaw` que si `!txInFlight`. `CHUNK_CAP_SOURCE` (`monitor`/`fresh`) choisit la source du plafond de chunk — sans moniteur, bascule automatique en `fresh` avec warning.
-- **P4 & P6 (12/09/2026)** — `createShutdownHandler()` : arrêt propre (SIGINT/SIGTERM), stop des jobs de fond (moniteur, watchdog) + destruction des providers WSS et RPC de lecture, idempotent ; `attemptChunk` s'arrête proprement quand le reliquat passe sous `MIN_CHUNK` (poussière) au lieu de boucler. 73 tests.
-- **P3 hardening (12/09/2026)** — le getter `WebSocketProvider.websocket` d'ethers v6 **lève** `Error("websocket closed")` une fois le socket détruit (il ne renvoie pas `null`) : l'optional chaining `?.` ne protège pas d'un getter qui throw. `unbind()`/`bind()`/`buildWss()` y accèdent désormais via un helper `safeWs()` qui capture l'exception — plus de crash non géré quand `fatal()` → `stop()` → `unbind()` traverse un provider mort : le bot sort via `process.exit(1)` proprement (c'était la cause du crash au réveil de veille malgré le backoff). Tests de régression ajoutés : `watchdog: un getter websocket qui THROW après close ne crashe pas fatal() (régression)` et `watchdog: getter websocket qui THROW dès le bind → stop()/fatal() propres`. 73 tests.
+- **P1** — `tx.wait()` wrapped in `withTimeout()` (`TX_TIMEOUT_MS`, default 60 s). On timeout, `getTxStatus()` gives real status: `pending`/`dropped` → warn + resume next block without decrementing; `mined` → receipt processed normally.
+- **P2** — `txInFlight = true` set immediately after the guard, before any `await`, to prevent double-submission at the same nonce.
+- **P3 (11/09/2026)** — `createWssWatchdog()` monitors the Alchemy WSS: heartbeat + silence threshold (`WS_STALL_MS`) detect a disconnect; `error`/`close` events are logged (URL masked via `maskUrl`, never a key), and reconnection rebuilds the provider (`buildWss`) then re-attaches the `block` subscription via `runner.setConnection`. Behavior driven by `WS_ON_STALL` (`reconnect` default / `exit`) with a `WS_MAX_RECONNECTS` budget; reconnection deferred while a tx is in flight. Since 12/09/2026: a reconnection failure (e.g. `getaddrinfo ENOTFOUND` after wake from sleep) no longer exits the process — attempts retry with exponential backoff (`WS_BACKOFF_BASE_MS` 5 s → cap `WS_BACKOFF_MAX_MS` 60 s), default budget is 10 (`WS_MAX_RECONNECTS`), and a health probe `getBlockNumber` (5 s timeout) verifies the fresh socket before adopting it.
+- **Startup diagnostics** — `logStartupParameters()` shows mUSDC_ADDRESS (with BaseScan link), wallet, masked WSS, RPC, gas tiers, etc. A zero balance triggers an explicit hint ("check MUSDC_ADDRESS").
+- **Balance monitoring** — `createBalanceMonitor()` re-reads the disposable balance on the read RPC every `BALANCE_MONITOR_INTERVAL` s (default 60 s, `0` to disable) and logs external changes (deposits, manual withdrawals, interest).
+- **Balance re-sync (11/09/2026)** — the monitor now feeds the withdrawal logic via `createBalanceWiring()`: `remainingRaw` is a getter derived from `targetRaw - processedRaw` (fixed-target mode) or `knownBalanceRaw` (full-balance mode). External deposits are auto-absorbed, a manual withdrawal reduces the target. Anti-double-count guard: monitor read only overwrites `knownBalanceRaw` if `!txInFlight`. `CHUNK_CAP_SOURCE` (`monitor`/`fresh`) chooses the chunk cap source — without a monitor, auto-switches to `fresh` with a warning.
+- **P4 & P6 (12/09/2026)** — `createShutdownHandler()`: clean shutdown (SIGINT/SIGTERM), stops background jobs (monitor, watchdog) + destroys WSS and read RPC providers, idempotent; `attemptChunk` stops cleanly when remainder falls below `MIN_CHUNK` (dust) instead of looping. 73 tests.
+- **P3 hardening (12/09/2026)** — the `WebSocketProvider.websocket` getter in ethers v6 **throws** `Error("websocket closed")` once the socket is destroyed (it does not return `null`): optional chaining `?.` does not protect against a throwing getter. `unbind()`/`bind()`/`buildWss()` now access it via a `safeWs()` helper that catches the exception — no more unhandled crash when `fatal()` → `stop()` → `unbind()` traverses a dead provider: the bot exits cleanly via `process.exit(1)` (this was the cause of the crash after wake from sleep despite the backoff). Added regression tests: `watchdog: websocket getter that THROWS after close does not crash fatal() (regression)` and `watchdog: websocket getter that THROWS on bind → clean stop()/fatal()`. 73 tests.
 
-### Logging
+### Documentation
 
-Amélioration récente : le bot utilise désormais Pino avec un log structuré dual (console + file avec rotation quotidienne, conserve 7 jours). Les logs importants (info/warn/error) apparaissent dans la console et le fichier, les logs debug vont uniquement dans le fichier. Les secrets sont automatiquement masqués des logs pour la sécurité.
+**Documentation must be kept in sync with every change.** After any modification:
 
-### Version bumping
+- Update `AGENTS.md` if code architecture, rules, or conventions changed
+- Update `PLAN.md` if the plan evolves or a new phase is added
+- Update `README.md` if user-facing behavior, configuration, or usage changes
 
-Nouveau : le système supporte désormais l'incrémentation automatique de version via les commits. Les commits conventionnels incrémentent le versionnement sémantique :
+### Version Bumping
 
-- `feat: ...` → incrémente la version mineure (0.0.1 → 0.1.0)
-- `fix: ...` → incrémente la version patch (0.0.1 → 0.0.2)
-- `release: ...` → incrémente la version patch
-- `BREAKING CHANGE:` → incrémente la version majeure (0.0.1 → 1.0.0)
+New: the system now supports automatic version incrementing via commits. Conventional commits increment semantic versioning:
 
-Le bump de version est déclenché par le hook pre-commit et s'exécute avant que le commit ne soit créé, en s'assurant que le bump de version fait partie du commit.
+- `feat: ...` → bumps minor version (0.0.1 → 0.1.0)
+- `fix: ...` → bumps patch version (0.0.1 → 0.0.2)
+- `release: ...` → bumps patch version
+- `BREAKING CHANGE:` → bumps major version (0.0.1 → 1.0.0)
+
+Version bumping is triggered by the pre-commit hook and runs before the commit is created, ensuring the version bump is part of the commit.

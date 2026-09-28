@@ -2,7 +2,11 @@
 
 Bot Node.js pour retirer des USDC du protocole Moonwell (Base) en plusieurs chunks. Conçu pour les grands retraits qui dépassent la liquidité disponible dans le pool en une seule transaction.
 
-> **Auteur original** : weez2 – merci infiniment pour la création et le maintien de ce projet.
+![Version](https://img.shields.io/github/package-json/v/rylorin/moonwell-withdraw-bot)
+![Quality Check](https://github.com/rylorin/moonwell-withdraw-bot/workflows/Quality%20Check/badge.svg?branch=master)
+![License](https://img.shields.io/badge/License-MIT-blue.svg)
+
+> **Auteur original** : weez2 – merci infiniment pour avoir partagé le script initial.
 
 ## Fonctionnalités
 
