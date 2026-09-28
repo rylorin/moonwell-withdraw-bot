@@ -151,7 +151,7 @@ async function main() {
       ? "  <-- 0 renvoyé: vérifiez MUSDC_ADDRESS (contrat mUSDC) et le réseau du RPC/WSS. Si l'adresse est fausse, le solde paraît nul."
       : "";
   logger.log(
-    `Redeemable USDC balance: ${fmt(startingBalanceRaw)}${lpBalanceDisplay}${zeroBalanceHint}`,
+    `Redeemable ${config.underlyingSymbol} balance: ${fmt(startingBalanceRaw)}${lpBalanceDisplay}${zeroBalanceHint}`,
   );
   const targetRaw =
     config.totalTarget !== null
@@ -163,12 +163,13 @@ async function main() {
     );
   }
   if (targetRaw !== null)
-    logger.log(`Target total withdrawal: ${fmt(targetRaw)} USDC`);
+    logger.log(
+      `Target total withdrawal: ${fmt(targetRaw)} ${config.underlyingSymbol}`,
+    );
   else {
     logger.log(
-      "Mode solde complet — retirera la totalité du solde décomposable. Les",
+      "Mode solde complet — retirera la totalité du solde décomposable. Les dépôts externes (moniteur de balance) seront suivis aussi.",
     );
-    logger.log("dépôts externes (moniteur de balance) seront suivis aussi.");
   }
   logger.log(
     "Will take up to 100% of available liquidity per chunk, capped at the known balance.",

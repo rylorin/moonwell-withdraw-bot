@@ -145,13 +145,16 @@ function makeDeps(overrides = {}) {
     calls.exit++;
   };
 
-  const env = {
-    WITHDRAW_AMOUNT: overrides.fullBalance
-      ? undefined
-      : String(overrides.targetUsd ?? 500),
-    MIN_CHUNK: String(overrides.minChunkUsdc ?? 5),
-    TX_TIMEOUT_MS: String(overrides.txTimeoutMs ?? 60),
-  };
+const env = {
+     WITHDRAW_AMOUNT: overrides.fullBalance
+       ? undefined
+       : String(overrides.targetUsd ?? 500),
+     MIN_CHUNK: String(overrides.minChunkUsdc ?? 5),
+     TX_TIMEOUT_MS: String(overrides.txTimeoutMs ?? 60),
+     STOP_AFTER_COMPLETION: overrides.stopAfterCompletion !== undefined
+       ? String(overrides.stopAfterCompletion)
+       : undefined,
+   };
   if (overrides.chunkCapSource) env.CHUNK_CAP_SOURCE = overrides.chunkCapSource;
   if (overrides.balanceInterval !== undefined)
     env.BALANCE_MONITOR_INTERVAL = String(overrides.balanceInterval);
@@ -633,7 +636,7 @@ test("runner: full-balance mode — remainingRaw derives from the known balance"
 });
 
 test("runner: full-balance mode stops when the balance reaches zero", async () => {
-  const d = makeDeps({ fullBalance: true, cash: 100 });
+  const d = makeDeps({ fullBalance: true, cash: 100, stopAfterCompletion: true });
   await d.runner.attemptChunk();
 
   assert.equal(d.calls.redeem, 1);
@@ -645,7 +648,7 @@ test("runner: full-balance mode stops when the balance reaches zero", async () =
 });
 
 test("runner: full-balance mode with a zero balance is done immediately", async () => {
-  const d = makeDeps({ fullBalance: true, initialBalanceUsd: 0, cash: 100 });
+  const d = makeDeps({ fullBalance: true, initialBalanceUsd: 0, cash: 100, stopAfterCompletion: true });
   await d.runner.attemptChunk();
 
   assert.equal(d.calls.redeem, 0);
@@ -1338,6 +1341,7 @@ test("P4: remaining dust below MIN_CHUNK stops cleanly", async () => {
     initialBalanceUsd: 2, // 2 USDC raw = 2n * 10n ** 6n
     minChunkUsdc: 5,
     cash: 100, // plenty of market liquidity — the stop is about the dust
+    stopAfterCompletion: true,
   });
 
   await d.runner.attemptChunk();

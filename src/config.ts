@@ -21,6 +21,7 @@ interface Config {
   wssBackoffMaxMs: number;
   wssOnStall: "exit" | "reconnect";
   underlyingSymbol: string;
+  stopAfterCompletion: boolean;
 }
 
 // ---------- CONFIG ----------
@@ -69,6 +70,10 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : 60_000,
     wssOnStall: env.WS_ON_STALL === "exit" ? "exit" : "reconnect",
     underlyingSymbol: env.UNDERLYING_SYMBOL || "USDC",
+    stopAfterCompletion:
+      env.STOP_AFTER_COMPLETION !== undefined
+        ? env.STOP_AFTER_COMPLETION.toLowerCase() === "true"
+        : env.WITHDRAW_AMOUNT !== undefined, // Default to true in target mode, false in balance mode
   };
 }
 
