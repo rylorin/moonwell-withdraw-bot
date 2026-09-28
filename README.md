@@ -1,30 +1,30 @@
 # Moonwell Withdraw Bot
 
-Bot Node.js pour retirer des USDC du protocole Moonwell (Base) en plusieurs chunks. Conçu pour les grands retraits qui dépassent la liquidité disponible dans le pool en une seule transaction.
+A Node.js bot for withdrawing USDC from the Moonwell protocol on Base by splitting large withdrawals into chunks. Designed for large withdrawals that exceed the available liquidity in the pool in a single transaction.
 
 ![Version](https://img.shields.io/github/package-json/v/rylorin/moonwell-withdraw-bot)
 ![Quality Check](https://github.com/rylorin/moonwell-withdraw-bot/workflows/Quality%20Check/badge.svg?branch=master)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
-> **Auteur original** : weez2 – merci infiniment pour avoir partagé le script initial.
+> **Original Author**: weez2 – thank you so much for sharing the initial script.
 
-## Fonctionnalités
+## Features
 
-- **Retrait chunké** : Divise automatiquement les grands retraits en plusieurs transactions basées sur la liquidité disponible
-- **Polling intelligent** : Vérifie la liquidité à chaque nouveau bloc via `getCash()`
-- **Gestion du gaz par paliers** : Ajuste automatiquement les frais de gaz selon la taille du chunk (Priorité EIP-1559)
-- **Fallback RPC** : Utilise un RPC public gratuit pour les lectures et bascule vers Alchemy en cas d'erreur
-- **Détection d'échecs** : Capture les `Failure` events des contrats Compound-fork même en cas de succès EVM
-- **Garantie atomicité** : Ne soumet pas de nouvelle transaction tant qu'une précédente est en cours (`txInFlight`)
-- **Re-synchronisation du solde** : Le bot re-lit le solde décomposable périodiquement (moniteur) et en mode solde complet la cible suit le solde courant — un dépôt externe est retiré automatiquement, un retrait manuel réduit la cible
-- **Source de plafond configurable** : `CHUNK_CAP_SOURCE=monitor` (dernière valeur du moniteur, défaut) ou `fresh` (relecture du solde à chaque tour)
+- **Chunked withdrawal**: Automatically splits large withdrawals into multiple transactions based on available liquidity
+- **Smart polling**: Checks available liquidity at every new block via `getCash()`
+- **Gas tier management**: Automatically adjusts gas fees based on chunk size (EIP-1559 Priority)
+- **RPC fallback**: Uses a public RPC for reads and falls back to Alchemy on error
+- **Failure detection**: Captures `Failure` events from Compound-fork contracts even in case of EVM success
+- **Atomicity guarantee**: Does not submit a new transaction while a previous one is in progress (`txInFlight`)
+- **Balance re-sync**: The bot periodically re-reads the redeemable balance (monitor) and in full balance mode the target follows the current balance — an external deposit is withdrawn automatically, a manual withdrawal reduces the target
+- **Configurable cap source**: `CHUNK_CAP_SOURCE=monitor` (last value from the monitor, default) or `fresh` (re-reads the balance every round)
 
-## Prérequis
+## Prerequisites
 
 - Node.js >= 18
 - yarn install ethers
-- Un wallet avec des USDC sur Base
-- Une clé API Alchemy (WSS)
+- A wallet with USDC on Base
+- An Alchemy API key (WSS)
 
 ## Installation
 
@@ -34,65 +34,65 @@ yarn install
 
 ## Configuration
 
-### Variables d'environnement (recommandé)
+### Environment Variables (recommended)
 
-| Variable                   | Description                                | Défaut                  |
-| -------------------------- | ------------------------------------------ | ----------------------- |
-| `BASE_WSS_URL`             | URL WebSocket Alchemy pour Base            | -                       |
-| `PRIVATE_KEY`              | Clé privée du wallet                       | -                       |
-| `WITHDRAW_AMOUNT`          | Montant total à retirer (USDC)             | Solde complet           |
-| `MIN_CHUNK`                | Montant minimum par chunk                  | 5 USDC                  |
-| `BASE_READ_RPC_URL`        | RPC public pour les lectures               | `https://base.drpc.org` |
-| `BALANCE_MONITOR_INTERVAL` | Relecture du solde décomposable (secondes) | `60` (`0` = désactivé)  |
-| `CHUNK_CAP_SOURCE`         | Source du plafond de chunk                 | `monitor` (ou `fresh`)  |
+| Variable                   | Description                                   | Default                 |
+| -------------------------- | --------------------------------------------- | ----------------------- |
+| `BASE_WSS_URL`             | Alchemy WebSocket URL for Base                | -                       |
+| `PRIVATE_KEY`              | Wallet private key                            | -                       |
+| `WITHDRAW_AMOUNT`          | Total amount to withdraw (USDC)               | Full balance            |
+| `MIN_CHUNK`                | Minimum chunk amount                          | 5 USDC                  |
+| `BASE_READ_RPC_URL`        | Public RPC for reads                          | `https://base.drpc.org` |
+| `BALANCE_MONITOR_INTERVAL` | Redeemable balance re-read interval (seconds) | `60` (`0` = disabled)   |
+| `CHUNK_CAP_SOURCE`         | Chunk cap source                              | `monitor` (or `fresh`)  |
 
-### Exemple d'exécution
+### Execution Example
 
 ```bash
-export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/VOTRE_CLE"
-export PRIVATE_KEY="votre_cle_privee"
+export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/VOUS_KEY"
+export PRIVATE_KEY="your_private_key"
 export WITHDRAW_AMOUNT=70000
 yarn start
 ```
 
-> **Note** : le script charge automatiquement un fichier `.env` (via `dotenv`) s'il est présent. Copiez [.env.example](.env.example) en `.env` puis remplissez les valeurs.
+> **Note**: The script automatically loads a `.env` file (via `dotenv`) if present. Copy [.env.example](.env.example) to `.env` and fill in the values.
 
-### Configuration du gaz
+### Gas Configuration
 
-Les paliers de gaz sont configurés dans le fichier :
+The gas tiers are configured in the file:
 
-| Palier | Priorité (gwei) | Max Fee (gwei) | Condition     |
-| ------ | --------------- | -------------- | ------------- |
-| 1      | 0.3             | 0.6            | Chunk >= $100 |
-| 2      | 0.1             | 0.3            | Chunk >= $30  |
-| 3      | 0.02            | 0.1            | Chunk < $30   |
+| Tier | Priority (gwei) | Max Fee (gwei) | Condition     |
+| ---- | --------------- | -------------- | ------------- |
+| 1    | 0.3             | 0.6            | Chunk >= $100 |
+| 2    | 0.1             | 0.3            | Chunk >= $30  |
+| 3    | 0.02            | 0.1            | Chunk < $30   |
 
-## Fonctionnement
+## How It Works
 
-1. Le bot se connecte au réseau Base via WebSocket
-2. Il lit le solde USDC décomposable du wallet
-3. À chaque bloc, il vérifie la liquidité disponible dans le pool mUSDC
-4. Il soumet une transaction `redeemUnderlying`, plafonnée à la plus petite valeur entre :
-   - La liquidité totale disponible (`getCash()`)
-   - Le montant restant à retirer
-   - Le solde décomposable connu (dernière valeur du moniteur, ou relecture à chaque tour selon `CHUNK_CAP_SOURCE`)
-5. Il répète à chaque bloc jusqu'à ce que la cible soit atteinte : sans `WITHDRAW_AMOUNT`, la cible suit le solde courant (les dépôts externes sont retirés automatiquement, un retrait manuel réduit la cible)
+1. The bot connects to the Base network via WebSocket
+2. It reads the user's USDC redeemable balance
+3. At every block, it checks the available liquidity in the mUSDC pool
+4. It submits a `redeemUnderlying` transaction, capped to the smallest value between:
+   - Total available liquidity (`getCash()`)
+   - The remaining amount to withdraw
+   - The known redeemable balance (last value from the monitor, or re-read every round according to `CHUNK_CAP_SOURCE`)
+5. It repeats at every block until the target is reached: without `WITHDRAW_AMOUNT`, the target follows the current balance (external deposits are withdrawn automatically, a manual withdrawal reduces the target)
 
-## Sécurité
+## Security
 
-- **Ne jamais coder en dur** la clé privée ou l'URL WSS
-- Utilisez des variables d'environnement ou un gestionnaire de secrets
-- Ne lancez ce script que sur un wallet que vous contrôlez
-- Vérifiez toujours l'adresse du contrat sur BaseScan : `0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22`
+- **Never hardcode** the private key or WSS URL
+- Use environment variables or a secrets manager
+- Only run this script on a wallet that you control
+- Always verify the contract address on BaseScan: `0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22`
 
 ## Contract
 
-- **mUSDC (Moonwell)** : `0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22` (Base)
-- Interface ABI : `getCash()`, `balanceOfUnderlying()`, `redeemUnderlying()`
+- **mUSDC (Moonwell)**: `0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22` (Base)
+- Interface ABI: `getCash()`, `balanceOfUnderlying()`, `redeemUnderlying()`
 
-## Notes techniques
+## Technical Notes
 
-- Le bot utilise deux providers : un RPC public pour les lectures fréquentes et Alchemy WSS pour les souscriptions de blocs et soumissions de transactions
-- En cas d'erreur de lecture sur le RPC public, le bot bascule automatiquement vers Alchemy
-- Les échecs soft (event `Failure`) sont gérés séparément des reverts EVM
-- Le solde restant est décrémenté uniquement après confirmation du succès on-chain
+- The bot uses two providers: a public RPC for frequent reads and Alchemy WSS for block subscription and transaction submission
+- If a read fails on the public RPC, the bot automatically falls back to Alchemy
+- Soft failures (event `Failure`) are handled separately from EVM reverts
+- The remaining balance is decremented only after on-chain confirmation of success

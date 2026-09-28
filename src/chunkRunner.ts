@@ -96,23 +96,25 @@ function createChunkRunner({
       return rem < 0n ? 0n : rem;
     },
   };
-const done = async (message?: string) => {
-     log.log(
-       message ??
-         (targetRaw === null
-           ? "Redeemable balance fully withdrawn. Done."
-           : "Target fully withdrawn. Done."),
-     );
-     state.stopped = true;
-     current.provider.removeAllListeners("block");
-     await current.provider.destroy();
-     // Only exit if stopAfterCompletion is true, or if we're in target mode (explicit totalTarget)
-     if (config.stopAfterCompletion) {
-       processExit(0);
-     } else {
-       log.log("  -> Continuing to monitor for new deposits (stopAfterCompletion=false)");
-     }
-   };
+  const done = async (message?: string) => {
+    log.log(
+      message ??
+        (targetRaw === null
+          ? "Redeemable balance fully withdrawn. Done."
+          : "Target fully withdrawn. Done."),
+    );
+    state.stopped = true;
+    current.provider.removeAllListeners("block");
+    await current.provider.destroy();
+    // Only exit if stopAfterCompletion is true, or if we're in target mode (explicit totalTarget)
+    if (config.stopAfterCompletion) {
+      processExit(0);
+    } else {
+      log.log(
+        "  -> Continuing to monitor for new deposits (stopAfterCompletion=false)",
+      );
+    }
+  };
   const attemptChunk = async () => {
     if (state.stopped || state.txInFlight) return;
     state.txInFlight = true;
