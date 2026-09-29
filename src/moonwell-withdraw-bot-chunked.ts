@@ -272,7 +272,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch((err) => {
-    logger.error(err);
+    logger.error(err instanceof Error ? err.message : err);
     process.exit(1);
   });
 }
