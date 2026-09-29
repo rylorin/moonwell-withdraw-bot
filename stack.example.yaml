@@ -1,3 +1,4 @@
+readme: "Rename me to stack.yaml and update as needed"
 remote: root@_YOURVPS.com_
 rsync_image: eeacms/rsync:latest
 backup_keep: 5

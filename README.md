@@ -3,8 +3,8 @@
 A Node.js bot for withdrawing USDC from the Moonwell protocol on Base by splitting large withdrawals into chunks. Designed for large withdrawals that exceed the available liquidity in the pool in a single transaction.
 
 ![Version](https://img.shields.io/github/package-json/v/rylorin/moonwell-withdraw-bot)
-![Quality Check](https://github.com/rylorin/moonwell-withdraw-bot/workflows/Quality%20Check/badge.svg?branch=master)
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
+[![Quality Check](https://github.com/rylorin/moonwell-withdraw-bot/actions/workflows/check.yml/badge.svg)](https://github.com/rylorin/moonwell-withdraw-bot/actions/workflows/check.yml)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/rylorin/moonwell-withdraw-bot/blob/main/LICENSE)
 
 > **Original Author**: weez2 – thank you so much for sharing the initial script.
 
@@ -21,8 +21,8 @@ A Node.js bot for withdrawing USDC from the Moonwell protocol on Base by splitti
 
 ## Prerequisites
 
-- Node.js >= 18
-- yarn install ethers
+- Node.js >= 22
+- yarn
 - A wallet with USDC on Base
 - An Alchemy API key (WSS)
 
