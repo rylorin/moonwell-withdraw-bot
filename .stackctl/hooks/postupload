@@ -4,7 +4,7 @@ set -e
 
 IMAGE_NAME="moonwell-withdraw-bot"
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Tag with the version from package.json. POSIX tools only — node is NOT
 # installed on the VPS that runs this script. sed extracts the value of the
